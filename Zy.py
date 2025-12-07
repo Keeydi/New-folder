@@ -34,6 +34,12 @@ QUIET_PERIOD_FOR_VALIDATION = 200  # Need quiet period before accepting spike as
 MIN_OSCILLATION_AMPLITUDE = 0.002  # Minimum oscillation amplitude after spike (2mV)
 FALSE_POSITIVE_THRESHOLD = 0.03  # If spike > this and no oscillation = likely false positive
 
+# Device movement detection parameters
+DEVICE_MOVEMENT_WINDOW = 30  # Samples to check for slow device movement
+DEVICE_MOVEMENT_THRESHOLD = 0.005  # Minimum amplitude to consider (5mV)
+MAX_RATE_OF_CHANGE = 0.001  # Maximum rate of change for device movement (slow = device, fast = vibration)
+MIN_PERSISTENCE = 20  # Minimum samples for continuous movement to be considered device movement
+
 # ADS1256 commands
 CMD_RESET  = 0xFE
 CMD_SYNC   = 0xFC
@@ -310,6 +316,76 @@ class SpikeDetector:
         
         return False, False, False
 
+class DeviceMovementDetector:
+    """
+    Detects slow, continuous device movement (not vibrations from hammer strikes).
+    Device movement: Slow rate of change, continuous, no oscillation.
+    Problem: "nagloloko na naman yung code biglaa, sa galaw na naman ng device siya nagrerespohys"
+    (Code is acting up again, responding to device movement)
+    """
+    def __init__(self):
+        self.signal_history = deque(maxlen=DEVICE_MOVEMENT_WINDOW)
+        self.large_signal_count = 0  # Count consecutive large signals
+        self.last_rate_of_change = 0.0
+        
+    def is_device_movement(self, current_signal):
+        """
+        Detect if this is slow device movement (not vibration from hammer).
+        Device movement characteristics:
+        - Slow rate of change (low frequency)
+        - Continuous large amplitude
+        - No oscillation pattern
+        - Persists over time
+        
+        IMPORTANT: Must NOT filter out valid vibrations (fast spikes, oscillations)
+        """
+        self.signal_history.append(current_signal)
+        
+        if len(self.signal_history) < 5:
+            return False
+        
+        # Calculate rate of change (how fast the signal is changing)
+        recent = list(self.signal_history)[-5:]
+        rate_of_change = abs(recent[-1] - recent[0]) / len(recent)
+        self.last_rate_of_change = rate_of_change
+        
+        # Check if signal is large
+        signal_magnitude = abs(current_signal)
+        if signal_magnitude > DEVICE_MOVEMENT_THRESHOLD:
+            self.large_signal_count += 1
+        else:
+            self.large_signal_count = 0
+        
+        # FIRST: Check for oscillation (if oscillating, it's NOT device movement - it's valid vibration)
+        # This is critical - we don't want to filter out real vibrations!
+        if len(self.signal_history) >= 10:
+            recent_window = list(self.signal_history)[-10:]
+            zero_crossings = 0
+            for i in range(1, len(recent_window)):
+                if (recent_window[i-1] >= 0 and recent_window[i] < 0) or \
+                   (recent_window[i-1] < 0 and recent_window[i] >= 0):
+                    zero_crossings += 1
+            
+            # If oscillating, it's NOT device movement - it's valid vibration!
+            if zero_crossings >= 2:
+                self.large_signal_count = 0  # Reset counter
+                return False
+        
+        # SECOND: Check for fast rate of change (spikes) - these are NOT device movement
+        # Fast changes = vibrations/spikes, not slow device movement
+        if rate_of_change > MAX_RATE_OF_CHANGE * 3:  # Much faster than device movement
+            self.large_signal_count = 0  # Reset counter - this is a spike, not continuous movement
+            return False
+        
+        # THIRD: Only if signal is slow, continuous, and large = device movement
+        # Device movement: Slow rate of change + continuous large signal + no oscillation
+        if signal_magnitude > DEVICE_MOVEMENT_THRESHOLD:
+            if rate_of_change < MAX_RATE_OF_CHANGE and self.large_signal_count >= MIN_PERSISTENCE:
+                # Slow, continuous, large signal with no oscillation = device movement
+                return True
+        
+        return False
+
 # ---------------- INITIALIZE ----------------
 print("Initializing ADS1256 ADC...")
 adc_reset()
@@ -334,6 +410,9 @@ tilt_remover = TiltRemover(window_size=TILT_FILTER_WINDOW)
 # Initialize spike detector to distinguish direct hits from hammer strikes
 spike_detector = SpikeDetector()
 
+# Initialize device movement detector to filter out slow device movement
+device_movement_detector = DeviceMovementDetector()
+
 # ---------------- SETUP LIVE PLOT ----------------
 plt.ion()
 fig, ax = plt.subplots()
@@ -354,6 +433,11 @@ print("High-pass filter active - removing remaining slow drift")
 print("Noise threshold: VERY LOW (0.5mV) - real vibration will pass through")
 print("DEBUG MODE: Showing diagnostic information")
 print("Showing RAW vibration data (no smoothing, no FFT yet)")
+print("")
+print("⚠️  CRITICAL: System outputs data for VIBRATIONS ONLY")
+print("   - Device movement/tilting = ZERO output (rejected)")
+print("   - Only fast vibrations from hammer strikes = data output")
+print("   - Slow, continuous movement = automatically filtered out")
 print("")
 print("Purpose: Verify system is working correctly")
 print("IMPORTANT: Place sensor DIRECTLY on impact point or very close to it")
@@ -444,7 +528,35 @@ try:
         else:
             quiet_period_samples = 0
 
-        # STEP 6: Spike Detection and Validation
+        # STEP 6: Device Movement/Tilt Detection (CRITICAL FIX)
+        # Problem: "nagloloko na naman yung code biglaa, sa galaw na naman ng device siya nagrerespohys"
+        # (Code is acting up again, responding to device movement)
+        # User requirement: "is the device capturing or giving data if the hardware is moving like tilt? 
+        # it should give data for vibration only"
+        # We need to detect and reject ANY slow, continuous device movement or tilt
+        
+        # Check for device movement on BOTH raw movement and processed signal
+        # Raw movement shows actual device movement/tilt
+        is_device_movement_raw = device_movement_detector.is_device_movement(movement_from_original)
+        # Processed signal (after tilt removal) might still show slow movement
+        is_device_movement_processed = device_movement_detector.is_device_movement(movement_no_tilt)
+        
+        # If EITHER detects device movement, reject it
+        is_device_movement = is_device_movement_raw or is_device_movement_processed
+        
+        # Additional check: If raw movement is large but slow (tilt/device movement)
+        # Check rate of change on raw signal
+        if len(raw_movement_history) >= 10:
+            recent_raw = list(raw_movement_history)[-10:]
+            raw_rate_of_change = abs(recent_raw[-1] - recent_raw[0]) / len(recent_raw)
+            raw_magnitude = abs(movement_from_original)
+            
+            # If large magnitude but slow rate = device movement/tilt
+            if raw_magnitude > 0.01 and raw_rate_of_change < MAX_RATE_OF_CHANGE:
+                # This is slow device movement/tilt, not vibration
+                is_device_movement = True
+        
+        # STEP 7: Spike Detection and Validation
         # Developer: "nasabayn siya sa spike" - system should align with spike
         # "yung kasama sa raw data is yung vibration every spike.. tapos yung bumlik na vibration"
         # (Raw data should include vibration every spike and the returning vibration)
@@ -465,45 +577,77 @@ try:
         current_is_direct_hit = is_direct_hit
         current_has_oscillation = has_oscillation
         
-        # STEP 7: Store RAW vibration data (no smoothing)
+        # STEP 8: Store RAW vibration data (no smoothing)
         # Developer: "for raw data palang, di pa nalalagyan nung FFT"
         # (Just for raw data, FFT not added yet)
         # We need clean raw data first to verify system is working
         # NO smoothing - we need raw signals for later FFT analysis
         
-        # CRITICAL FIX: Filter out direct sensor hits and false positives
+        # CRITICAL FIX: Filter out device movement, direct sensor hits, and false positives
         raw_movement_magnitude = abs(movement_from_original)
         
-        # Reject direct sensor hits - these are NOT what we want
+        # PRIORITY 1: Reject device movement/tilt - CRITICAL
+        # User requirement: "it should give data for vibration only"
+        # Problem: "sa galaw na naman ng device siya nagrerespohys"
+        if is_device_movement:
+            # Device movement/tilt detected - reject it completely (ZERO output)
+            # This addresses: "nagloloko na naman yung code biglaa, sa galaw na naman ng device"
+            # User requirement: device should NOT give data when hardware is moving/tilting
+            display_signal = 0.0
+            if DEBUG_MODE and sample_count % 100 == 0:
+                print(f"  🚫 DEVICE MOVEMENT/TILT REJECTED (slow, continuous movement - ZERO output)")
+        # PRIORITY 2: Reject direct sensor hits - these are NOT what we want
         # We want vibrations from hammer strikes, not direct hits on ADXL
-        if is_direct_hit:
+        elif is_direct_hit:
             # Direct sensor hit detected - reject it (set to zero or very small)
             # This addresses: "nagreresponse yung graph kapag yung mismong adxl yung pinupukpok"
             display_signal = 0.0
             if DEBUG_MODE and sample_count % 100 == 0:
                 print(f"  🚫 DIRECT SENSOR HIT REJECTED (no oscillation pattern)")
         elif raw_movement_magnitude > 0.01:  # If raw movement > 10mV
-            # Large raw movement detected - check if it's a valid hammer strike
-            if is_spike and has_oscillation:
-                # Valid hammer strike with oscillation - this is what we want!
-                # Use the signal after HPF (before noise threshold) to preserve it
-                if abs(vibration_before_threshold) > 0.0001:
-                    display_signal = vibration_before_threshold
+            # Large raw movement detected - check if it's a valid hammer strike (vibration)
+            # IMPORTANT: Only accept if it's a FAST vibration, not slow device movement
+            
+            # Check if this is fast (vibration) or slow (device movement)
+            if len(raw_movement_history) >= 5:
+                recent_raw = list(raw_movement_history)[-5:]
+                raw_rate = abs(recent_raw[-1] - recent_raw[0]) / len(recent_raw)
+                
+                # If slow rate of change, it's device movement - reject it
+                if raw_rate < MAX_RATE_OF_CHANGE:
+                    display_signal = 0.0  # Slow = device movement, not vibration
+                    if DEBUG_MODE and sample_count % 100 == 0:
+                        print(f"  🚫 SLOW MOVEMENT REJECTED (rate: {raw_rate*1000:.3f}mV/sample - not vibration)")
+                elif is_spike and has_oscillation:
+                    # Valid hammer strike with oscillation - this is what we want!
+                    # Use the signal after HPF (before noise threshold) to preserve it
+                    if abs(vibration_before_threshold) > 0.0001:
+                        display_signal = vibration_before_threshold
+                    else:
+                        display_signal = movement_no_tilt
+                elif is_spike and not has_oscillation:
+                    # Spike detected but no oscillation yet - might be developing
+                    # Wait a bit, but still show the signal (it might develop oscillation)
+                    if abs(vibration_before_threshold) > 0.0001:
+                        display_signal = vibration_before_threshold
+                    else:
+                        display_signal = movement_no_tilt
                 else:
-                    display_signal = movement_no_tilt
-            elif is_spike and not has_oscillation:
-                # Spike detected but no oscillation yet - might be developing
-                # Wait a bit, but still show the signal (it might develop oscillation)
-                if abs(vibration_before_threshold) > 0.0001:
-                    display_signal = vibration_before_threshold
-                else:
-                    display_signal = movement_no_tilt
+                    # Large movement but not a clear spike - could be valid vibration
+                    if abs(vibration_before_threshold) > 0.0001:
+                        display_signal = vibration_before_threshold
+                    else:
+                        display_signal = movement_no_tilt
             else:
-                # Large movement but not a clear spike - could be valid vibration
-                if abs(vibration_before_threshold) > 0.0001:
-                    display_signal = vibration_before_threshold
+                # Not enough history - be conservative, only show if it's clearly a spike
+                if is_spike and has_oscillation:
+                    if abs(vibration_before_threshold) > 0.0001:
+                        display_signal = vibration_before_threshold
+                    else:
+                        display_signal = movement_no_tilt
                 else:
-                    display_signal = movement_no_tilt
+                    # Not enough info - reject to be safe
+                    display_signal = 0.0
         else:
             # Small raw movement - apply stricter filtering to prevent false positives
             # This addresses: "minsan kpag nakastay lng siya is biglang may mga unnecessary n signals"
@@ -546,6 +690,9 @@ try:
             if floating_data_detected:
                 status = "⚠️ FLOATING DATA DETECTED (not tilt/vibration) - ADC drift/noise"
                 signal_type = "FLOATING"
+            elif is_device_movement:
+                status = "🚫 DEVICE MOVEMENT/TILT (rejected) - ZERO output (vibration only!)"
+                signal_type = "DEVICE_MOVEMENT"
             elif recent_data:
                 signal_range = max(recent_data) - min(recent_data)
                 if signal_range > IMPACT_THRESHOLD:
@@ -578,18 +725,24 @@ try:
                 voltage_variation = 0.0
             
             print(f"Sample {sample_count}: [{signal_type}]")
-            print(f"  Raw Voltage: {voltage:.6f}V")
+            print(f"  Raw Voltage: {voltage:.6f}V (baseline: {baseline_offset:.6f}V)")
             print(f"  Movement (before filters): {movement_from_original:.6f}V")
             if DEBUG_MODE and len(raw_movement_history) >= 10:
                 raw_range = max(raw_movement_history) - min(raw_movement_history)
-                print(f"  Raw Movement Range (last 50): {raw_range:.6f}V")
+                raw_max = max(abs(min(raw_movement_history)), abs(max(raw_movement_history)))
+                print(f"  Raw Movement Range (last 50): {raw_range:.6f}V, Max: {raw_max:.6f}V")
             print(f"  After Tilt Removal: {movement_no_tilt:.6f}V")
             print(f"  After HPF: {vibration_before_threshold:.6f}V")
             print(f"  Final Vibration: {vibration_signal:.6f}V")
+            print(f"  Display Signal: {display_signal:.6f}V")
             if len(raw_voltage_history) >= 50:
                 print(f"  Voltage Drift: {voltage_drift*1000:.3f}mV/sample | Variation: {voltage_variation*1000:.3f}mV")
+            print(f"  Device Movement: {is_device_movement} (Rate: {device_movement_detector.last_rate_of_change*1000:.3f}mV/sample)")
             print(f"  Spike Detection: Spike={current_is_spike}, DirectHit={current_is_direct_hit}, Oscillation={current_has_oscillation}")
             print(f"  Quiet Period: {quiet_period_samples} samples")
+            if recent_data:
+                data_max = max(abs(min(recent_data)), abs(max(recent_data)))
+                print(f"  Recent Data Max: {data_max:.6f}V")
             print(f"  Status: {status}\n")
             
             # DEBUG: Alert if raw movement shows signal but final is zero
