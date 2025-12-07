@@ -71,13 +71,18 @@ def moving_average(data_deque, window_size):
 
 def calibrate_baseline(num_samples=BASELINE_SAMPLES):
     """
-    Calibrate baseline to remove DC offset (tilt/gravity component).
-    This removes the 'floating' data and isolates vibration signals.
+    Calibrate ORIGINAL POSITION of accelerometer.
+    As developer said: "yung kinukuha dapat natin yung layo nung galaw vs sa original position"
+    (We need to get the distance of movement vs the original position)
+    
+    This measures the original position (includes tilt/gravity) so we can calculate
+    the distance/change from this position when vibration occurs.
     """
-    print(f"\n=== BASELINE CALIBRATION ===")
-    print(f"Collecting {num_samples} samples to measure DC offset...")
+    print(f"\n=== CALIBRATING ORIGINAL POSITION ===")
+    print(f"Collecting {num_samples} samples to measure original position...")
     print("IMPORTANT: Keep device STATIONARY (no impacts) during calibration!")
-    print("This will remove tilt/gravity component and show only vibration.\n")
+    print("This establishes the 'original position' reference point.")
+    print("All future readings will show distance/movement from this position.\n")
     time.sleep(2)  # Give user time to read
     
     baseline_readings = []
@@ -97,10 +102,11 @@ def calibrate_baseline(num_samples=BASELINE_SAMPLES):
     baseline = np.mean(baseline_readings)
     std_dev = np.std(baseline_readings)
     
-    print(f"\nBaseline calibration complete:")
-    print(f"  DC Offset (tilt/gravity): {baseline:.6f} V")
+    print(f"\nOriginal position calibration complete:")
+    print(f"  Original Position (includes tilt/gravity): {baseline:.6f} V")
     print(f"  Noise level: ±{std_dev:.6f} V")
-    print(f"  This offset will be subtracted to show only vibration signals\n")
+    print(f"  All readings will show: (current_position - original_position)")
+    print(f"  This gives us the 'distance of movement' from original position\n")
     
     return baseline
 
@@ -160,18 +166,21 @@ fig, ax = plt.subplots()
 data = deque([0.0]*MAX_POINTS, maxlen=MAX_POINTS)  # Start at 0 (no DC offset)
 line, = ax.plot(data)
 ax.set_ylim(-0.1, 0.1)  # Show around zero for vibration signals
-ax.set_title("ADXL1002Z Impact Echo - Vibration Detection (No Smoothing)")
+ax.set_title("ADXL1002Z - Raw Vibration Data (Distance from Original Position)")
 ax.set_xlabel("Sample")
-ax.set_ylabel("Voltage (V) - Raw Vibration Signal")
+ax.set_ylabel("Voltage (V) - Movement from Original Position")
 ax.axhline(y=0, color='r', linestyle='--', alpha=0.3, label='Zero (baseline)')
 ax.grid(True, alpha=0.3)
 ax.legend()
 
-print("\n=== IMPACT ECHO DETECTION MODE ===")
-print("DC offset removed - Strong high-pass filter active")
-print("Smoothing DISABLED - showing raw vibration signals")
-print("Hit with steel ball hammer - look for oscillatory waves (echoes)!")
-print("Echoes indicate internal delaminations/cracks/voids")
+print("\n=== RAW DATA COLLECTION MODE ===")
+print("Measuring: Distance of movement vs original position")
+print("High-pass filter active - removing slow tilt changes")
+print("Showing RAW vibration data (no smoothing, no FFT yet)")
+print("")
+print("Purpose: Verify system is working correctly")
+print("Hit with steel ball hammer - observe raw vibration response")
+print("FFT analysis for defect detection will be added later")
 print("Press Ctrl+C to stop.\n")
 
 # ---------------- MAIN LOOP ----------------
@@ -185,20 +194,23 @@ try:
         raw_val = read_adc()
         voltage = adc_to_voltage(raw_val)
 
-        # STEP 1: Remove DC baseline offset (tilt/gravity component)
-        # This removes the "floating" static offset
-        voltage_ac = voltage - baseline_offset
+        # STEP 1: Calculate distance from original position
+        # Developer: "yung kinukuha dapat natin yung layo nung galaw vs sa original position"
+        # (We need to get the distance of movement vs the original position)
+        # This measures how far the accelerometer has moved from its original position
+        movement_from_original = voltage - baseline_offset
 
-        # STEP 2: Apply STRONG high-pass filter to remove DC/tilt
-        # This ensures we only see dynamic vibration (oscillatory waves)
-        vibration_signal = hpf.filter(voltage_ac)
+        # STEP 2: Apply high-pass filter to remove slow tilt changes
+        # This ensures we only see dynamic vibration, not slow tilt drift
+        # The filter removes any remaining DC/low-frequency components
+        vibration_signal = hpf.filter(movement_from_original)
 
-        # STEP 3: For impact echo, we need RAW vibration signals
-        # DO NOT smooth - moving average kills the oscillatory echoes!
-        # The echoes bouncing back from delaminations are high-frequency signals
+        # STEP 3: Store RAW vibration data (no smoothing)
+        # Developer: "for raw data palang, di pa nalalagyan nung FFT"
+        # (Just for raw data, FFT not added yet)
+        # We need clean raw data first to verify system is working
+        # NO smoothing - we need raw signals for later FFT analysis
         data.append(vibration_signal)  # Store raw vibration signal
-        
-        # NO SMOOTHING for impact echo detection - we need to see the raw waves!
 
         sample_count += 1
 
@@ -230,8 +242,8 @@ try:
             else:
                 status = "Initializing..."
             
-            print(f"Sample {sample_count}: Raw={voltage:.6f}V, "
-                  f"DC-removed={voltage_ac:.6f}V, "
+            print(f"Sample {sample_count}: Original={voltage:.6f}V, "
+                  f"Movement={movement_from_original:.6f}V, "
                   f"Vibration={vibration_signal:.6f}V [{status}]")
 
 except KeyboardInterrupt:
