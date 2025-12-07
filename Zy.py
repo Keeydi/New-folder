@@ -435,9 +435,10 @@ print("DEBUG MODE: Showing diagnostic information")
 print("Showing RAW vibration data (no smoothing, no FFT yet)")
 print("")
 print("⚠️  CRITICAL: System outputs data for VIBRATIONS ONLY")
-print("   - Device movement/tilting = ZERO output (rejected)")
-print("   - Only fast vibrations from hammer strikes = data output")
-print("   - Slow, continuous movement = automatically filtered out")
+print("   ✅ Echo vibrations (oscillation) = ALWAYS ACCEPTED")
+print("   ✅ Fast vibrations (spikes) = ACCEPTED")
+print("   🚫 Device movement/tilting = ZERO output (rejected)")
+print("   🚫 Slow, continuous movement = automatically filtered out")
 print("")
 print("Purpose: Verify system is working correctly")
 print("IMPORTANT: Place sensor DIRECTLY on impact point or very close to it")
@@ -531,27 +532,22 @@ try:
         # STEP 6: Device Movement/Tilt Detection (CRITICAL FIX)
         # Problem: "nagloloko na naman yung code biglaa, sa galaw na naman ng device siya nagrerespohys"
         # (Code is acting up again, responding to device movement)
-        # User requirement: "is the device capturing or giving data if the hardware is moving like tilt? 
-        # it should give data for vibration only"
-        # We need to detect and reject ANY slow, continuous device movement or tilt
+        # User requirement: "i love that there is no Response even in tilt"
+        # BUT: "Make sure that it will Response in Echo vibration"
+        # We need to detect and reject slow device movement/tilt, but NOT vibrations
         
-        # Check for device movement on BOTH raw movement and processed signal
-        # Raw movement shows actual device movement/tilt
-        is_device_movement_raw = device_movement_detector.is_device_movement(movement_from_original)
-        # Processed signal (after tilt removal) might still show slow movement
-        is_device_movement_processed = device_movement_detector.is_device_movement(movement_no_tilt)
+        # Check for device movement on processed signal (after tilt removal)
+        # Only check processed signal to avoid false positives on vibrations
+        is_device_movement = device_movement_detector.is_device_movement(movement_no_tilt)
         
-        # If EITHER detects device movement, reject it
-        is_device_movement = is_device_movement_raw or is_device_movement_processed
-        
-        # Additional check: If raw movement is large but slow (tilt/device movement)
-        # Check rate of change on raw signal
-        if len(raw_movement_history) >= 10:
+        # Additional check: If raw movement is large but slow AND no oscillation
+        # Only reject if it's slow AND no oscillation (vibrations have oscillation)
+        if len(raw_movement_history) >= 10 and not has_oscillation:
             recent_raw = list(raw_movement_history)[-10:]
             raw_rate_of_change = abs(recent_raw[-1] - recent_raw[0]) / len(recent_raw)
             raw_magnitude = abs(movement_from_original)
             
-            # If large magnitude but slow rate = device movement/tilt
+            # If large magnitude but slow rate AND no oscillation = device movement/tilt
             if raw_magnitude > 0.01 and raw_rate_of_change < MAX_RATE_OF_CHANGE:
                 # This is slow device movement/tilt, not vibration
                 is_device_movement = True
@@ -583,71 +579,81 @@ try:
         # We need clean raw data first to verify system is working
         # NO smoothing - we need raw signals for later FFT analysis
         
-        # CRITICAL FIX: Filter out device movement, direct sensor hits, and false positives
+        # CRITICAL FIX: Filter out device movement, direct sensor hits, but ACCEPT vibrations
+        # User requirement: "Make sure that it will Response in Echo vibration"
+        # "no Response even for Vibration" - need to fix this!
         raw_movement_magnitude = abs(movement_from_original)
         
-        # PRIORITY 1: Reject device movement/tilt - CRITICAL
-        # User requirement: "it should give data for vibration only"
-        # Problem: "sa galaw na naman ng device siya nagrerespohys"
-        if is_device_movement:
-            # Device movement/tilt detected - reject it completely (ZERO output)
-            # This addresses: "nagloloko na naman yung code biglaa, sa galaw na naman ng device"
-            # User requirement: device should NOT give data when hardware is moving/tilting
-            display_signal = 0.0
+        # PRIORITY 1: ALWAYS ACCEPT echo vibrations (oscillation detected)
+        # This is the most important - echo vibrations MUST pass through
+        # User: "Make sure that it will Response in Echo vibration"
+        if has_oscillation:
+            # Echo vibration detected - ALWAYS accept this!
+            # This is what we want - returning vibration from hammer strikes
+            if abs(vibration_before_threshold) > 0.0001:
+                display_signal = vibration_before_threshold
+            else:
+                display_signal = movement_no_tilt
             if DEBUG_MODE and sample_count % 100 == 0:
-                print(f"  🚫 DEVICE MOVEMENT/TILT REJECTED (slow, continuous movement - ZERO output)")
-        # PRIORITY 2: Reject direct sensor hits - these are NOT what we want
-        # We want vibrations from hammer strikes, not direct hits on ADXL
-        elif is_direct_hit:
-            # Direct sensor hit detected - reject it (set to zero or very small)
-            # This addresses: "nagreresponse yung graph kapag yung mismong adxl yung pinupukpok"
-            display_signal = 0.0
+                print(f"  ✅ ECHO VIBRATION ACCEPTED (oscillation detected)")
+        
+        # PRIORITY 2: ACCEPT spikes (fast vibrations from hammer strikes)
+        # Even if oscillation not yet detected, spikes should pass through
+        elif is_spike:
+            # Spike detected - this is likely a hammer strike
+            # Show the signal (oscillation might develop)
+            if abs(vibration_before_threshold) > 0.0001:
+                display_signal = vibration_before_threshold
+            else:
+                display_signal = movement_no_tilt
             if DEBUG_MODE and sample_count % 100 == 0:
-                print(f"  🚫 DIRECT SENSOR HIT REJECTED (no oscillation pattern)")
+                print(f"  ✅ SPIKE/VIBRATION ACCEPTED (fast vibration detected)")
+        
+        # PRIORITY 3: Check rate of change - fast = vibration, slow = device movement
         elif raw_movement_magnitude > 0.01:  # If raw movement > 10mV
-            # Large raw movement detected - check if it's a valid hammer strike (vibration)
-            # IMPORTANT: Only accept if it's a FAST vibration, not slow device movement
-            
-            # Check if this is fast (vibration) or slow (device movement)
             if len(raw_movement_history) >= 5:
                 recent_raw = list(raw_movement_history)[-5:]
                 raw_rate = abs(recent_raw[-1] - recent_raw[0]) / len(recent_raw)
                 
-                # If slow rate of change, it's device movement - reject it
-                if raw_rate < MAX_RATE_OF_CHANGE:
-                    display_signal = 0.0  # Slow = device movement, not vibration
-                    if DEBUG_MODE and sample_count % 100 == 0:
-                        print(f"  🚫 SLOW MOVEMENT REJECTED (rate: {raw_rate*1000:.3f}mV/sample - not vibration)")
-                elif is_spike and has_oscillation:
-                    # Valid hammer strike with oscillation - this is what we want!
-                    # Use the signal after HPF (before noise threshold) to preserve it
+                # Fast rate = vibration, accept it
+                if raw_rate > MAX_RATE_OF_CHANGE * 2:  # Fast = vibration
                     if abs(vibration_before_threshold) > 0.0001:
                         display_signal = vibration_before_threshold
                     else:
                         display_signal = movement_no_tilt
-                elif is_spike and not has_oscillation:
-                    # Spike detected but no oscillation yet - might be developing
-                    # Wait a bit, but still show the signal (it might develop oscillation)
-                    if abs(vibration_before_threshold) > 0.0001:
-                        display_signal = vibration_before_threshold
-                    else:
-                        display_signal = movement_no_tilt
-                else:
-                    # Large movement but not a clear spike - could be valid vibration
-                    if abs(vibration_before_threshold) > 0.0001:
-                        display_signal = vibration_before_threshold
-                    else:
-                        display_signal = movement_no_tilt
-            else:
-                # Not enough history - be conservative, only show if it's clearly a spike
-                if is_spike and has_oscillation:
-                    if abs(vibration_before_threshold) > 0.0001:
-                        display_signal = vibration_before_threshold
-                    else:
-                        display_signal = movement_no_tilt
-                else:
-                    # Not enough info - reject to be safe
+                # Slow rate = might be device movement, but check device_movement detector
+                elif is_device_movement:
+                    # Confirmed device movement - reject it
                     display_signal = 0.0
+                    if DEBUG_MODE and sample_count % 100 == 0:
+                        print(f"  🚫 DEVICE MOVEMENT REJECTED (slow, continuous)")
+                else:
+                    # Slow but not confirmed device movement - could be small vibration
+                    # Accept it to be safe (better to show than miss)
+                    display_signal = vibration_signal
+            else:
+                # Not enough history - accept if signal is present
+                if abs(vibration_before_threshold) > 0.0001:
+                    display_signal = vibration_before_threshold
+                else:
+                    display_signal = movement_no_tilt
+        
+        # PRIORITY 4: Reject device movement/tilt (only if no vibration detected)
+        # User requirement: "i love that there is no Response even in tilt"
+        elif is_device_movement:
+            # Device movement/tilt detected - reject it (ZERO output)
+            # This addresses: "nagloloko na naman yung code biglaa, sa galaw na naman ng device"
+            display_signal = 0.0
+            if DEBUG_MODE and sample_count % 100 == 0:
+                print(f"  🚫 DEVICE MOVEMENT/TILT REJECTED (slow, continuous - ZERO output)")
+        
+        # PRIORITY 5: Reject direct sensor hits
+        elif is_direct_hit:
+            # Direct sensor hit detected - reject it
+            # This addresses: "nagreresponse yung graph kapag yung mismong adxl yung pinupukpok"
+            display_signal = 0.0
+            if DEBUG_MODE and sample_count % 100 == 0:
+                print(f"  🚫 DIRECT SENSOR HIT REJECTED (no oscillation pattern)")
         else:
             # Small raw movement - apply stricter filtering to prevent false positives
             # This addresses: "minsan kpag nakastay lng siya is biglang may mga unnecessary n signals"
@@ -690,22 +696,22 @@ try:
             if floating_data_detected:
                 status = "⚠️ FLOATING DATA DETECTED (not tilt/vibration) - ADC drift/noise"
                 signal_type = "FLOATING"
-            elif is_device_movement:
-                status = "🚫 DEVICE MOVEMENT/TILT (rejected) - ZERO output (vibration only!)"
-                signal_type = "DEVICE_MOVEMENT"
             elif recent_data:
                 signal_range = max(recent_data) - min(recent_data)
                 if signal_range > IMPACT_THRESHOLD:
                     # Check spike detector status
-                    if current_is_direct_hit:
+                    if current_has_oscillation:
+                        status = "✅ ECHO VIBRATION DETECTED - Oscillatory echoes present!"
+                        signal_type = "ECHO_VIBRATION"
+                    elif current_is_direct_hit:
                         status = "🚫 DIRECT SENSOR HIT (rejected) - Hit concrete, not sensor!"
                         signal_type = "DIRECT_HIT"
-                    elif current_has_oscillation:
-                        status = "✅ HAMMER STRIKE DETECTED - Oscillatory echoes present!"
-                        signal_type = "VIBRATION"
                     else:
-                        status = "✅ IMPACT DETECTED - Waiting for oscillation..."
-                        signal_type = "SPIKE"
+                        status = "✅ VIBRATION DETECTED - Fast vibration from hammer strike!"
+                        signal_type = "VIBRATION"
+            elif is_device_movement:
+                status = "🚫 DEVICE MOVEMENT/TILT (rejected) - ZERO output (vibration only!)"
+                signal_type = "DEVICE_MOVEMENT"
                 elif quiet_period_samples > QUIET_PERIOD_FOR_VALIDATION:
                     status = "🔇 QUIET - System idle (ready for impact)"
                     signal_type = "QUIET"
