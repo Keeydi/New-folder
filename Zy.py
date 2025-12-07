@@ -14,12 +14,13 @@ SPI_SPEED_HZ = 5000
 DRDY_PIN = 25         # GPIO connected to DRDY (Pin 11)
 MAX_POINTS = 500      # Number of points shown in live plot
 PLOT_UPDATE = 1       # Update plot every sample for real-time response
-SMOOTH_WINDOW = 3     # Number of samples for moving average (reduced for faster response)
+SMOOTH_WINDOW = 1     # Number of samples for moving average (1 = no smoothing, maximum sensitivity)
 BASELINE_SAMPLES = 200  # Samples to collect for baseline calibration (increased for better accuracy)
-NOISE_THRESHOLD = 0.0005  # Ignore signals below this voltage (0.5mV) - lowered for better sensitivity
-MEDIAN_FILTER_SIZE = 3  # Size of median filter (reduced for faster response)
-IMPACT_THRESHOLD = 0.005  # Threshold for impact detection (5mV)
+NOISE_THRESHOLD = 0.0001  # Ignore signals below this voltage (0.1mV) - very low threshold
+MEDIAN_FILTER_SIZE = 1  # Size of median filter (minimal filtering for maximum sensitivity)
+IMPACT_THRESHOLD = 0.001  # Threshold for impact detection (1mV) - very sensitive
 INVERT_SIGNAL = True  # Set to True if signal is inverted (only negative output)
+PGA_GAIN = 4  # Programmable Gain Amplifier: 1, 2, 4, 8, 16, 32, 64 (higher = more sensitive)
 
 # ADS1256 commands
 CMD_RESET  = 0xFE
@@ -69,8 +70,11 @@ def read_register(reg):
 def configure_adc():
     """Configure ADS1256 for stable operation"""
     # Configure ADCON register
-    # Bit 7: CLKOUT off, Bit 6-4: Sensor detect off, Bit 3-0: PGA gain = 1
-    write_register(REG_ADCON, 0x00)  # PGA = 1, no sensor detect
+    # Bit 7: CLKOUT off, Bit 6-4: Sensor detect off, Bit 3-0: PGA gain
+    # PGA gain values: 0=1x, 1=2x, 2=4x, 3=8x, 4=16x, 5=32x, 6=64x
+    pga_value = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4, 32: 5, 64: 6}.get(PGA_GAIN, 2)
+    write_register(REG_ADCON, pga_value)  # Set PGA gain for better sensitivity
+    print(f"PGA Gain set to {PGA_GAIN}x for better sensitivity")
     
     # Configure DRATE register (data rate)
     # 0xF0 = 30,000 SPS, 0xE0 = 15,000 SPS, 0xD0 = 7,500 SPS
@@ -239,28 +243,27 @@ try:
         # Add to median filter buffer
         raw_data_buffer.append(voltage_corrected)
         
-        # Apply median filter to remove noise spikes (light filtering for fast response)
-        if len(raw_data_buffer) >= MEDIAN_FILTER_SIZE:
+        # Apply median filter only if size > 1 (for maximum sensitivity, skip if size is 1)
+        if MEDIAN_FILTER_SIZE > 1 and len(raw_data_buffer) >= MEDIAN_FILTER_SIZE:
             filtered_voltage = median_filter(raw_data_buffer, MEDIAN_FILTER_SIZE)
         else:
-            filtered_voltage = voltage_corrected
+            filtered_voltage = voltage_corrected  # Use raw signal for maximum sensitivity
         
         # Impact detection - check for strong signal immediately
         impact_detected = abs(filtered_voltage) >= IMPACT_THRESHOLD
         
         # Noise threshold filtering - only suppress very small signals
+        # Don't zero out signals, just use them as-is for maximum sensitivity
         if abs(filtered_voltage) < NOISE_THRESHOLD:
-            # Signal is below threshold, treat as zero (quiet state)
-            filtered_voltage = 0.0
             quiet_samples += 1
         else:
             quiet_samples = 0
 
-        # Append filtered reading immediately (no delay)
+        # Append filtered reading immediately (no delay) - keep all signals
         data.append(filtered_voltage)
 
-        # Light smoothing only (reduced for faster response)
-        if len(data) >= SMOOTH_WINDOW:
+        # Minimal smoothing for faster response (only if window size > 1)
+        if SMOOTH_WINDOW > 1 and len(data) >= SMOOTH_WINDOW:
             smoothed_voltage = moving_average(data, SMOOTH_WINDOW)
             data[-1] = smoothed_voltage  # replace latest with smoothed value
         
