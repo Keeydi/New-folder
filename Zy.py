@@ -16,13 +16,15 @@ MAX_POINTS = 500      # Number of points shown in live plot
 PLOT_UPDATE = 5       # Update plot every 5 samples
 SMOOTH_WINDOW = 5     # Number of samples for moving average (DISABLED for impact echo)
 BASELINE_SAMPLES = 200  # Samples for baseline calibration (to remove DC/tilt)
-HPF_ALPHA = 0.90      # High-pass filter coefficient (0.90 = ~20Hz cutoff - very strong filtering)
+HPF_ALPHA = 0.95      # High-pass filter coefficient (0.95 = less aggressive - preserves vibration)
                       # Lower = stronger filtering (removes more DC/tilt)
-                      # For impact echo: 0.85-0.95 range works well
+                      # 0.95 = good balance - removes slow tilt but keeps fast vibration
 USE_SMOOTHING = False  # DISABLE smoothing for impact echo - need raw vibration signals
 IMPACT_THRESHOLD = 0.01  # Voltage threshold to detect impact events
-NOISE_THRESHOLD = 0.005  # Ignore signals below this (5mV) - filters electrical noise
-                         # Adjust based on your amplifier gain and noise level
+NOISE_THRESHOLD = 0.0005  # Very low threshold (0.5mV) - don't filter out real vibration
+                         # Vibration from smashing should be much larger than this
+TILT_FILTER_WINDOW = 100  # Larger window - only removes very slow tilt, preserves vibration
+DEBUG_MODE = True  # Show raw signals before filtering for diagnosis
 
 # ADS1256 commands
 CMD_RESET  = 0xFE
@@ -117,16 +119,16 @@ def calibrate_baseline(num_samples=BASELINE_SAMPLES):
 
 class HighPassFilter:
     """
-    Strong high-pass filter to remove DC drift and low-frequency tilt.
-    For impact echo, we need to see oscillatory waves, not DC/tilt.
-    Lower alpha = stronger filtering (removes more DC).
+    High-pass filter to remove slow tilt while preserving fast vibration.
+    For impact echo, we need to see oscillatory waves, not slow tilt.
+    Lower alpha = stronger filtering (removes more DC/tilt).
     """
     def __init__(self, alpha=HPF_ALPHA):
-        self.alpha = alpha  # Filter coefficient (0.90 = strong filtering, removes DC/tilt)
+        self.alpha = alpha  # Filter coefficient (0.95 = less aggressive, preserves vibration)
         self.prev_output = 0.0
         self.prev_input = 0.0
         self.initialized = False
-        self.warmup_samples = 50  # Warmup period to stabilize filter
+        self.warmup_samples = 20  # Shorter warmup to respond faster
     
     def filter(self, input_value):
         if not self.initialized:
@@ -152,6 +154,38 @@ class HighPassFilter:
         self.prev_output = output
         return output
 
+class TiltRemover:
+    """
+    Removes slow tilt by tracking slow-moving average and subtracting it.
+    This preserves fast vibration while removing slow tilt movement.
+    Uses exponential moving average for faster response to vibration.
+    """
+    def __init__(self, window_size=TILT_FILTER_WINDOW):
+        self.window_size = window_size
+        self.signal_history = deque(maxlen=window_size)
+        self.initialized = False
+        self.ema_alpha = 0.05  # Exponential moving average - very slow (only tracks tilt)
+        self.ema_value = 0.0
+    
+    def remove_tilt(self, signal):
+        self.signal_history.append(signal)
+        
+        if not self.initialized:
+            if len(self.signal_history) < 10:  # Need minimum samples
+                return signal  # Return as-is until we have enough samples
+            # Initialize EMA with current average
+            self.ema_value = np.mean(list(self.signal_history))
+            self.initialized = True
+        
+        # Update exponential moving average (very slow - only tracks tilt)
+        # EMA responds slowly, so fast vibration passes through
+        self.ema_value = self.ema_alpha * signal + (1 - self.ema_alpha) * self.ema_value
+        
+        # Subtract slow tilt (EMA) to get vibration only
+        vibration_only = signal - self.ema_value
+        
+        return vibration_only
+
 # ---------------- INITIALIZE ----------------
 print("Initializing ADS1256 ADC...")
 adc_reset()
@@ -170,6 +204,9 @@ if measured_noise > NOISE_THRESHOLD:
 # Initialize high-pass filter to remove any remaining DC drift
 hpf = HighPassFilter(alpha=HPF_ALPHA)
 
+# Initialize tilt remover to subtract slow tilt from signal
+tilt_remover = TiltRemover(window_size=TILT_FILTER_WINDOW)
+
 # ---------------- SETUP LIVE PLOT ----------------
 plt.ion()
 fig, ax = plt.subplots()
@@ -185,24 +222,28 @@ ax.legend()
 
 print("\n=== RAW DATA COLLECTION MODE ===")
 print("Measuring: Distance of movement vs original position")
-print("High-pass filter active - removing slow tilt changes")
-print("Noise threshold filtering active - ignoring electrical noise")
+print("Tilt removal active - subtracting slow tilt, preserving fast vibration")
+print("High-pass filter active - removing remaining slow drift")
+print("Noise threshold: VERY LOW (0.5mV) - real vibration will pass through")
+print("DEBUG MODE: Showing diagnostic information")
 print("Showing RAW vibration data (no smoothing, no FFT yet)")
 print("")
 print("Purpose: Verify system is working correctly")
-print("Hit with steel ball hammer - observe raw vibration response")
-print("FFT analysis for defect detection will be added later")
+print("IMPORTANT: Place sensor DIRECTLY on impact point or very close to it")
+print("Smash beside sensor - vibration should travel through concrete/rock")
+print("If no signal detected, check:")
+print("  - Sensor contact with surface (must be firmly attached)")
+print("  - Distance from impact point (closer = stronger signal)")
+print("  - Impact force (harder hit = stronger vibration)")
 print("")
-print("NOTE: If you see continuous noise when idle:")
-print("  - Check XY-FD amplifier gain potentiometers (may be too high)")
-print("  - Adjust NOISE_THRESHOLD in code if needed")
-print("  - Ensure stable power supply")
+print("FFT analysis for defect detection will be added later")
 print("Press Ctrl+C to stop.\n")
 
 # ---------------- MAIN LOOP ----------------
 sample_count = 0
 raw_voltage_history = deque(maxlen=100)  # Track raw voltage for floating data detection
 quiet_period_samples = 0  # Count consecutive quiet samples
+raw_movement_history = deque(maxlen=50)  # Track raw movement for debug
 
 try:
     while True:
@@ -219,13 +260,22 @@ try:
         # (We need to get the distance of movement vs the original position)
         # This measures how far the accelerometer has moved from its original position
         movement_from_original = voltage - baseline_offset
+        raw_movement_history.append(movement_from_original)  # For debug
 
-        # STEP 2: Apply high-pass filter to remove slow tilt changes
-        # This ensures we only see dynamic vibration, not slow tilt drift
-        # The filter removes any remaining DC/low-frequency components
-        vibration_signal = hpf.filter(movement_from_original)
+        # STEP 2: Remove slow tilt using exponential moving average
+        # This preserves fast vibration (from smashing) while removing slow tilt
+        # Tilt = slow movement, Vibration = fast movement
+        movement_no_tilt = tilt_remover.remove_tilt(movement_from_original)
 
-        # STEP 3: Detect FLOATING DATA (not tilt, not vibration)
+        # STEP 3: Apply high-pass filter to remove any remaining slow drift
+        # This is a secondary filter to catch any remaining DC/low-frequency components
+        vibration_signal = hpf.filter(movement_no_tilt)
+        
+        # DEBUG: Also track raw movement (before all filtering) to see if signal exists
+        if DEBUG_MODE:
+            raw_signal_for_debug = movement_from_original
+
+        # STEP 4: Detect FLOATING DATA (not tilt, not vibration)
         # Developer: "parang floating data, di sa tilt or sa vibration eh"
         # Floating data = slow drift in raw voltage even when stationary
         floating_data_detected = False
@@ -238,9 +288,12 @@ try:
             if abs(voltage_trend) > 0.0001 and voltage_std < 0.01:
                 floating_data_detected = True
 
-        # STEP 4: Apply noise threshold to filter electrical noise
+        # STEP 5: Apply noise threshold to filter electrical noise
+        # IMPORTANT: Keep threshold VERY LOW so real vibration from smashing passes through
         # The amplifier and ADC can pick up noise even when stationary
-        # Only show signals above the noise threshold
+        # Only filter very small signals (electrical noise), not real vibration
+        # For impact echo, even small vibrations are important
+        vibration_before_threshold = vibration_signal
         if abs(vibration_signal) < NOISE_THRESHOLD:
             # Signal is below noise threshold - treat as zero (quiet state)
             vibration_signal = 0.0
@@ -248,12 +301,21 @@ try:
         else:
             quiet_period_samples = 0
 
-        # STEP 5: Store RAW vibration data (no smoothing)
+        # STEP 6: Store RAW vibration data (no smoothing)
         # Developer: "for raw data palang, di pa nalalagyan nung FFT"
         # (Just for raw data, FFT not added yet)
         # We need clean raw data first to verify system is working
         # NO smoothing - we need raw signals for later FFT analysis
-        data.append(vibration_signal)  # Store raw vibration signal
+        
+        # DEBUG MODE: Show raw movement if no filtered signal (to diagnose filtering issues)
+        if DEBUG_MODE and abs(vibration_signal) < 0.001:
+            # If filtered signal is zero, show raw movement to see if signal exists
+            # This helps diagnose if signal is being filtered out
+            display_signal = movement_from_original * 0.1  # Scale down for visibility
+        else:
+            display_signal = vibration_signal
+        
+        data.append(display_signal)  # Store signal for display
 
         sample_count += 1
 
@@ -305,10 +367,24 @@ try:
                 voltage_variation = 0.0
             
             print(f"Sample {sample_count}: [{signal_type}]")
-            print(f"  Raw Voltage: {voltage:.6f}V | Movement: {movement_from_original:.6f}V | Vibration: {vibration_signal:.6f}V")
+            print(f"  Raw Voltage: {voltage:.6f}V")
+            print(f"  Movement (before filters): {movement_from_original:.6f}V")
+            if DEBUG_MODE and len(raw_movement_history) >= 10:
+                raw_range = max(raw_movement_history) - min(raw_movement_history)
+                print(f"  Raw Movement Range (last 50): {raw_range:.6f}V")
+            print(f"  After Tilt Removal: {movement_no_tilt:.6f}V")
+            print(f"  After HPF: {vibration_before_threshold:.6f}V")
+            print(f"  Final Vibration: {vibration_signal:.6f}V")
             if len(raw_voltage_history) >= 50:
                 print(f"  Voltage Drift: {voltage_drift*1000:.3f}mV/sample | Variation: {voltage_variation*1000:.3f}mV")
             print(f"  Status: {status}\n")
+            
+            # DEBUG: Alert if raw movement shows signal but final is zero
+            if DEBUG_MODE and len(raw_movement_history) >= 10:
+                raw_max = max(abs(min(raw_movement_history)), abs(max(raw_movement_history)))
+                if raw_max > 0.01 and abs(vibration_signal) < 0.001:
+                    print(f"  ⚠️ WARNING: Raw movement shows {raw_max:.6f}V but filtered to {vibration_signal:.6f}V")
+                    print(f"     Signal might be filtered out! Check filter settings.\n")
 
 except KeyboardInterrupt:
     print("Live capture stopped by user")
