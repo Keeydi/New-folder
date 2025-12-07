@@ -201,6 +201,9 @@ print("Press Ctrl+C to stop.\n")
 
 # ---------------- MAIN LOOP ----------------
 sample_count = 0
+raw_voltage_history = deque(maxlen=100)  # Track raw voltage for floating data detection
+quiet_period_samples = 0  # Count consecutive quiet samples
+
 try:
     while True:
         # Wait for DRDY low
@@ -209,6 +212,7 @@ try:
 
         raw_val = read_adc()
         voltage = adc_to_voltage(raw_val)
+        raw_voltage_history.append(voltage)  # Track for floating data detection
 
         # STEP 1: Calculate distance from original position
         # Developer: "yung kinukuha dapat natin yung layo nung galaw vs sa original position"
@@ -221,14 +225,30 @@ try:
         # The filter removes any remaining DC/low-frequency components
         vibration_signal = hpf.filter(movement_from_original)
 
-        # STEP 3: Apply noise threshold to filter electrical noise
+        # STEP 3: Detect FLOATING DATA (not tilt, not vibration)
+        # Developer: "parang floating data, di sa tilt or sa vibration eh"
+        # Floating data = slow drift in raw voltage even when stationary
+        floating_data_detected = False
+        if len(raw_voltage_history) >= 50:
+            # Check for slow drift in raw voltage (floating data)
+            voltage_trend = np.polyfit(range(len(raw_voltage_history)), list(raw_voltage_history), 1)[0]
+            voltage_std = np.std(list(raw_voltage_history))
+            
+            # Floating data: slow drift (>0.0001 V/sample) with low variation
+            if abs(voltage_trend) > 0.0001 and voltage_std < 0.01:
+                floating_data_detected = True
+
+        # STEP 4: Apply noise threshold to filter electrical noise
         # The amplifier and ADC can pick up noise even when stationary
         # Only show signals above the noise threshold
         if abs(vibration_signal) < NOISE_THRESHOLD:
             # Signal is below noise threshold - treat as zero (quiet state)
             vibration_signal = 0.0
+            quiet_period_samples += 1
+        else:
+            quiet_period_samples = 0
 
-        # STEP 4: Store RAW vibration data (no smoothing)
+        # STEP 5: Store RAW vibration data (no smoothing)
         # Developer: "for raw data palang, di pa nalalagyan nung FFT"
         # (Just for raw data, FFT not added yet)
         # We need clean raw data first to verify system is working
@@ -252,22 +272,43 @@ try:
             fig.canvas.draw()
             fig.canvas.flush_events()
 
-        # Detect impact events and print status
+        # Detect impact events and print status with floating data detection
         if sample_count % 500 == 0:
             # Check if we're seeing vibration (not just noise)
             recent_data = list(data)[-100:] if len(data) >= 100 else list(data)
-            if recent_data:
+            
+            # Determine signal type
+            if floating_data_detected:
+                status = "⚠️ FLOATING DATA DETECTED (not tilt/vibration) - ADC drift/noise"
+                signal_type = "FLOATING"
+            elif recent_data:
                 signal_range = max(recent_data) - min(recent_data)
                 if signal_range > IMPACT_THRESHOLD:
-                    status = "IMPACT DETECTED - Look for oscillatory echoes!"
+                    status = "✅ IMPACT DETECTED - Look for oscillatory echoes!"
+                    signal_type = "VIBRATION"
+                elif quiet_period_samples > 100:
+                    status = "🔇 QUIET - System idle (no floating data)"
+                    signal_type = "QUIET"
                 else:
-                    status = "Waiting for impact..."
+                    status = "⏳ Waiting for impact..."
+                    signal_type = "WAITING"
             else:
-                status = "Initializing..."
+                status = "🔄 Initializing..."
+                signal_type = "INIT"
             
-            print(f"Sample {sample_count}: Original={voltage:.6f}V, "
-                  f"Movement={movement_from_original:.6f}V, "
-                  f"Vibration={vibration_signal:.6f}V [{status}]")
+            # Calculate statistics for diagnosis
+            if len(raw_voltage_history) >= 50:
+                voltage_drift = np.polyfit(range(len(raw_voltage_history)), list(raw_voltage_history), 1)[0]
+                voltage_variation = np.std(list(raw_voltage_history))
+            else:
+                voltage_drift = 0.0
+                voltage_variation = 0.0
+            
+            print(f"Sample {sample_count}: [{signal_type}]")
+            print(f"  Raw Voltage: {voltage:.6f}V | Movement: {movement_from_original:.6f}V | Vibration: {vibration_signal:.6f}V")
+            if len(raw_voltage_history) >= 50:
+                print(f"  Voltage Drift: {voltage_drift*1000:.3f}mV/sample | Variation: {voltage_variation*1000:.3f}mV")
+            print(f"  Status: {status}\n")
 
 except KeyboardInterrupt:
     print("Live capture stopped by user")
