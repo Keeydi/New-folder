@@ -14,9 +14,11 @@ SPI_SPEED_HZ = 5000
 DRDY_PIN = 25         # GPIO connected to DRDY (Pin 11)
 MAX_POINTS = 500      # Number of points shown in live plot
 PLOT_UPDATE = 5       # Update plot every 5 samples
-SMOOTH_WINDOW = 5     # Number of samples for moving average
+SMOOTH_WINDOW = 3     # Number of samples for moving average (reduced for vibration)
 BASELINE_SAMPLES = 200  # Samples for baseline calibration
-NOISE_THRESHOLD = 0.001  # Ignore signals below this voltage (1mV)
+NOISE_THRESHOLD = 0.0001  # Lower threshold for vibration detection (0.1mV)
+HPF_ALPHA = 0.995      # High-pass filter coefficient (higher = stronger filtering of DC/tilt)
+VIBRATION_THRESHOLD = 0.0005  # Threshold to detect actual vibration (0.5mV)
 
 # ADS1256 commands
 CMD_RESET  = 0xFE
@@ -83,8 +85,9 @@ def configure_adc():
     write_register(REG_ADCON, 0x20)  # Default settings
     
     # Configure DRATE register (data rate)
-    # 0xE0 = 15,000 SPS - good balance for impact echo
-    write_register(REG_DRATE, 0xE0)  # 15,000 SPS
+    # 0xF0 = 30,000 SPS, 0xE0 = 15,000 SPS, 0xD0 = 7,500 SPS
+    # Higher rate for better vibration capture
+    write_register(REG_DRATE, 0xF0)  # 30,000 SPS for impact echo vibrations
     
     # Configure IO register - set unused pins to avoid floating
     write_register(REG_IO, 0x00)  # All GPIO as inputs
@@ -157,6 +160,15 @@ def moving_average(data_deque, window_size):
     else:
         return sum(list(data_deque)[-window_size:])/window_size
 
+def high_pass_filter(new_value, prev_output, prev_input, alpha):
+    """
+    Digital high-pass filter to remove DC offset and slow changes (tilt)
+    while preserving high-frequency vibrations
+    alpha: filter coefficient (0.99-0.999 typical, higher = stronger DC removal)
+    """
+    output = alpha * (prev_output + new_value - prev_input)
+    return output, new_value
+
 # ---------------- INITIALIZE ----------------
 print("Initializing ADS1256 ADC...")
 adc_reset()
@@ -167,23 +179,41 @@ time.sleep(0.3)  # Allow ADC to stabilize after configuration
 # Calibrate baseline to fix floating data issue
 baseline_offset = calibrate_baseline()
 print(f"Baseline offset: {baseline_offset:.6f} V")
-print("Starting data acquisition with baseline correction...\n")
+print("Starting data acquisition with AC coupling (vibration only, tilt filtered)...\n")
+
+# Initialize high-pass filter with baseline
+# Take a few samples to stabilize the filter
+print("Initializing high-pass filter...")
+hpf_init_output = 0.0
+hpf_init_input = 0.0
+for _ in range(50):
+    if wait_for_drdy():
+        raw_val = read_adc()
+        voltage = adc_to_voltage(raw_val)
+        voltage_dc = voltage - baseline_offset
+        hpf_init_output, hpf_init_input = high_pass_filter(voltage_dc, hpf_init_output, hpf_init_input, HPF_ALPHA)
+print("High-pass filter initialized.\n")
 
 # ---------------- SETUP LIVE PLOT ----------------
 plt.ion()
 fig, ax = plt.subplots()
 data = deque([0.0]*MAX_POINTS, maxlen=MAX_POINTS)  # Start at 0 after baseline correction
 line, = ax.plot(data)
-ax.set_ylim(-0.1, 0.1)  # Adjusted for baseline-corrected data
-ax.set_title("ADXL1002Z Live Vibration (Baseline Corrected)")
+ax.set_ylim(-0.05, 0.05)  # Adjusted for vibration signals
+ax.set_title("ADXL1002Z Live Vibration (AC-Coupled, Tilt Filtered)")
 ax.set_xlabel("Sample")
 ax.set_ylabel("Voltage (V)")
 ax.grid(True)
 
 print("Starting live vibration capture. Press Ctrl+C to stop.")
+print("Note: System will ignore slow tilt changes, only capture vibrations.\n")
 
 # ---------------- MAIN LOOP ----------------
 sample_count = 0
+hpf_prev_output = hpf_init_output  # High-pass filter previous output
+hpf_prev_input = hpf_init_input    # High-pass filter previous input
+vibration_detected = False
+
 try:
     while True:
         # Wait for DRDY before reading
@@ -194,20 +224,30 @@ try:
         raw_val = read_adc()
         voltage = adc_to_voltage(raw_val)
 
-        # Remove baseline offset to fix floating data
-        voltage_corrected = voltage - baseline_offset
+        # Remove static baseline offset
+        voltage_dc_removed = voltage - baseline_offset
         
-        # Only process signals above noise threshold
-        if abs(voltage_corrected) < NOISE_THRESHOLD:
-            voltage_corrected = 0.0
+        # Apply high-pass filter to remove DC and slow changes (tilt)
+        # This allows vibrations through while blocking static tilt
+        voltage_filtered, hpf_prev_input = high_pass_filter(
+            voltage_dc_removed, hpf_prev_output, hpf_prev_input, HPF_ALPHA
+        )
+        hpf_prev_output = voltage_filtered
+        
+        # Detect vibration (high-frequency signal)
+        if abs(voltage_filtered) > VIBRATION_THRESHOLD:
+            vibration_detected = True
+        else:
+            vibration_detected = False
 
-        # Append corrected reading
-        data.append(voltage_corrected)
+        # Append filtered reading (vibration only, no tilt)
+        data.append(voltage_filtered)
 
-        # Apply moving average for smoother plot (only if we have enough data)
+        # Apply light moving average only for display smoothing
+        # Don't over-smooth or we'll lose vibration details
         if len(data) >= SMOOTH_WINDOW:
             smoothed_voltage = moving_average(data, SMOOTH_WINDOW)
-            data[-1] = smoothed_voltage  # replace latest with smoothed value
+            data[-1] = smoothed_voltage
 
         sample_count += 1
 
@@ -218,18 +258,18 @@ try:
                 data_min, data_max = min(data), max(data)
                 # Only scale if there's actual signal variation
                 if abs(data_max - data_min) > 0.0001:
-                    margin = max(abs(data_min), abs(data_max)) * 0.1 + 0.01
+                    margin = max(abs(data_min), abs(data_max)) * 0.2 + 0.005
                     ax.set_ylim(data_min - margin, data_max + margin)
                 else:
                     # If all quiet, show small range around zero
-                    ax.set_ylim(-NOISE_THRESHOLD * 2, NOISE_THRESHOLD * 2)
+                    ax.set_ylim(-VIBRATION_THRESHOLD * 3, VIBRATION_THRESHOLD * 3)
             fig.canvas.draw()
             fig.canvas.flush_events()
         
         # Print sample info periodically
         if sample_count % 100 == 0:
-            status = "QUIET" if abs(voltage_corrected) < NOISE_THRESHOLD else "ACTIVE"
-            print(f"Sample {sample_count}: Raw={voltage:.6f}V, Corrected={voltage_corrected:.6f}V [{status}]")
+            status = "VIBRATION!" if vibration_detected else "quiet"
+            print(f"Sample {sample_count}: Raw={voltage:.6f}V, Filtered={voltage_filtered:.6f}V [{status}]")
 
 except KeyboardInterrupt:
     print("Live capture stopped by user")
