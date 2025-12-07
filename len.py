@@ -693,22 +693,39 @@ try:
             recent_data = list(data)[-100:] if len(data) >= 100 else list(data)
             
             # Determine signal type with spike detection info
+            # PRIORITY: Check for vibrations FIRST before checking device movement
             if floating_data_detected:
                 status = "⚠️ FLOATING DATA DETECTED (not tilt/vibration) - ADC drift/noise"
                 signal_type = "FLOATING"
+            elif current_has_oscillation:
+                # Echo vibration detected - prioritize this over device movement
+                status = "✅ ECHO VIBRATION DETECTED - Oscillatory echoes present!"
+                signal_type = "ECHO_VIBRATION"
+            elif current_is_direct_hit:
+                status = "🚫 DIRECT SENSOR HIT (rejected) - Hit concrete, not sensor!"
+                signal_type = "DIRECT_HIT"
+            elif current_is_spike:
+                # Spike/vibration detected - prioritize this over device movement
+                status = "✅ VIBRATION DETECTED - Fast vibration from hammer strike!"
+                signal_type = "VIBRATION"
             elif recent_data:
                 signal_range = max(recent_data) - min(recent_data)
                 if signal_range > IMPACT_THRESHOLD:
-                    # Check spike detector status
-                    if current_has_oscillation:
-                        status = "✅ ECHO VIBRATION DETECTED - Oscillatory echoes present!"
-                        signal_type = "ECHO_VIBRATION"
-                    elif current_is_direct_hit:
-                        status = "🚫 DIRECT SENSOR HIT (rejected) - Hit concrete, not sensor!"
-                        signal_type = "DIRECT_HIT"
+                    # Large signal range indicates vibration
+                    status = "✅ VIBRATION DETECTED - Fast vibration from hammer strike!"
+                    signal_type = "VIBRATION"
+                elif is_device_movement:
+                    # Only report device movement if no vibration indicators and signal is small
+                    status = "🚫 DEVICE MOVEMENT/TILT (rejected) - ZERO output (vibration only!)"
+                    signal_type = "DEVICE_MOVEMENT"
+                else:
+                    # Small signal, not device movement - could be quiet or waiting
+                    if quiet_period_samples > QUIET_PERIOD_FOR_VALIDATION:
+                        status = "🔇 QUIET - System idle (ready for impact)"
+                        signal_type = "QUIET"
                     else:
-                        status = "✅ VIBRATION DETECTED - Fast vibration from hammer strike!"
-                        signal_type = "VIBRATION"
+                        status = "⏳ Waiting for impact..."
+                        signal_type = "WAITING"
             elif is_device_movement:
                 status = "🚫 DEVICE MOVEMENT/TILT (rejected) - ZERO output (vibration only!)"
                 signal_type = "DEVICE_MOVEMENT"
