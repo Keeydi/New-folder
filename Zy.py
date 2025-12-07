@@ -26,6 +26,14 @@ NOISE_THRESHOLD = 0.0005  # Very low threshold (0.5mV) - don't filter out real v
 TILT_FILTER_WINDOW = 100  # Larger window - only removes very slow tilt, preserves vibration
 DEBUG_MODE = True  # Show raw signals before filtering for diagnosis
 
+# Spike detection parameters
+SPIKE_DETECTION_WINDOW = 50  # Samples to analyze for spike pattern
+DIRECT_HIT_THRESHOLD = 0.05  # Very large amplitude = likely direct sensor hit (50mV)
+OSCILLATION_MIN_CYCLES = 3  # Minimum oscillation cycles to be considered real vibration
+QUIET_PERIOD_FOR_VALIDATION = 200  # Need quiet period before accepting spike as valid
+MIN_OSCILLATION_AMPLITUDE = 0.002  # Minimum oscillation amplitude after spike (2mV)
+FALSE_POSITIVE_THRESHOLD = 0.03  # If spike > this and no oscillation = likely false positive
+
 # ADS1256 commands
 CMD_RESET  = 0xFE
 CMD_SYNC   = 0xFC
@@ -186,6 +194,122 @@ class TiltRemover:
         
         return vibration_only
 
+class SpikeDetector:
+    """
+    Detects and validates spikes to distinguish:
+    - Direct sensor hits: Very large, immediate, no oscillation pattern
+    - Hammer strikes: Initial spike + oscillatory echoes (returning vibration)
+    
+    Based on images: We want to see initial spike followed by oscillatory waves
+    """
+    def __init__(self):
+        self.signal_history = deque(maxlen=SPIKE_DETECTION_WINDOW)
+        self.quiet_period_count = 0
+        self.last_spike_sample = -9999
+        self.spike_detected = False
+        self.current_is_spike = False
+        self.current_is_direct_hit = False
+        self.current_has_oscillation = False
+        
+    def detect_oscillation(self, window_size=30):
+        """
+        Check if there's an oscillatory pattern after a spike.
+        Real vibrations from hammer strikes show oscillatory waves.
+        Direct sensor hits show no oscillation.
+        """
+        if len(self.signal_history) < window_size:
+            return False, 0
+        
+        recent = list(self.signal_history)[-window_size:]
+        
+        # Count zero crossings (oscillation indicator)
+        zero_crossings = 0
+        for i in range(1, len(recent)):
+            if (recent[i-1] >= 0 and recent[i] < 0) or (recent[i-1] < 0 and recent[i] >= 0):
+                zero_crossings += 1
+        
+        # Check for oscillatory pattern: multiple zero crossings + amplitude variation
+        amplitude_variation = max(recent) - min(recent)
+        has_oscillation = (zero_crossings >= OSCILLATION_MIN_CYCLES * 2 and 
+                          amplitude_variation >= MIN_OSCILLATION_AMPLITUDE)
+        
+        return has_oscillation, zero_crossings
+    
+    def is_direct_hit(self, current_signal, sample_num):
+        """
+        Detect if this is a direct sensor hit (not a hammer strike).
+        Direct hits: Very large amplitude, immediate, no oscillation pattern.
+        """
+        if abs(current_signal) < DIRECT_HIT_THRESHOLD:
+            return False
+        
+        # Check if we had a quiet period before this spike
+        # Real hammer strikes usually come after quiet periods
+        if self.quiet_period_count < 50:  # Not enough quiet period
+            # Could be a direct hit or noise spike
+            if abs(current_signal) > FALSE_POSITIVE_THRESHOLD:
+                # Very large spike without quiet period = likely direct hit
+                return True
+        
+        # Check for oscillation pattern
+        has_oscillation, zero_crosses = self.detect_oscillation()
+        
+        # If spike is very large but no oscillation pattern = likely direct hit
+        if abs(current_signal) > DIRECT_HIT_THRESHOLD and not has_oscillation:
+            # Wait a bit to see if oscillation develops
+            if sample_num - self.last_spike_sample > 20:  # Give time for oscillation
+                if not has_oscillation:
+                    return True  # No oscillation after waiting = direct hit
+        
+        return False
+    
+    def update(self, signal, sample_num):
+        """
+        Update spike detector and return validation result.
+        Returns: (is_valid_spike, is_direct_hit, has_oscillation)
+        """
+        self.signal_history.append(signal)
+        
+        # Track quiet periods
+        if abs(signal) < NOISE_THRESHOLD * 2:
+            self.quiet_period_count += 1
+        else:
+            self.quiet_period_count = 0
+        
+        # Detect spike
+        is_spike = abs(signal) > IMPACT_THRESHOLD
+        
+        if is_spike:
+            self.last_spike_sample = sample_num
+            self.spike_detected = True
+            self.current_is_spike = True
+            
+            # Check if direct hit
+            is_direct = self.is_direct_hit(signal, sample_num)
+            self.current_is_direct_hit = is_direct
+            
+            # Check for oscillation (might not be present immediately)
+            has_oscillation, zero_crosses = self.detect_oscillation()
+            self.current_has_oscillation = has_oscillation
+            
+            return True, is_direct, has_oscillation
+        else:
+            # Check oscillation in recent history (after spike)
+            if self.spike_detected and (sample_num - self.last_spike_sample) < SPIKE_DETECTION_WINDOW:
+                has_oscillation, zero_crosses = self.detect_oscillation()
+                self.current_has_oscillation = has_oscillation
+                # Update direct hit status - if oscillation develops, it's not a direct hit
+                if has_oscillation:
+                    self.current_is_direct_hit = False
+                return self.current_is_spike, self.current_is_direct_hit, has_oscillation
+            else:
+                # No recent spike
+                self.current_is_spike = False
+                self.current_is_direct_hit = False
+                self.current_has_oscillation = False
+        
+        return False, False, False
+
 # ---------------- INITIALIZE ----------------
 print("Initializing ADS1256 ADC...")
 adc_reset()
@@ -206,6 +330,9 @@ hpf = HighPassFilter(alpha=HPF_ALPHA)
 
 # Initialize tilt remover to subtract slow tilt from signal
 tilt_remover = TiltRemover(window_size=TILT_FILTER_WINDOW)
+
+# Initialize spike detector to distinguish direct hits from hammer strikes
+spike_detector = SpikeDetector()
 
 # ---------------- SETUP LIVE PLOT ----------------
 plt.ion()
@@ -244,8 +371,14 @@ sample_count = 0
 raw_voltage_history = deque(maxlen=100)  # Track raw voltage for floating data detection
 quiet_period_samples = 0  # Count consecutive quiet samples
 raw_movement_history = deque(maxlen=50)  # Track raw movement for debug
+signal_history_for_spike = deque(maxlen=SPIKE_DETECTION_WINDOW)  # For spike detection
 
 try:
+    # Initialize spike detection variables
+    current_is_spike = False
+    current_is_direct_hit = False
+    current_has_oscillation = False
+    
     while True:
         # Wait for DRDY low
         while lgpio.gpio_read(h, DRDY_PIN) == 1:
@@ -311,28 +444,79 @@ try:
         else:
             quiet_period_samples = 0
 
-        # STEP 6: Store RAW vibration data (no smoothing)
+        # STEP 6: Spike Detection and Validation
+        # Developer: "nasabayn siya sa spike" - system should align with spike
+        # "yung kasama sa raw data is yung vibration every spike.. tapos yung bumlik na vibration"
+        # (Raw data should include vibration every spike and the returning vibration)
+        # Problem: "minsan kpag nakastay lng siya is biglang may mga unnecessary n signals na mlalki na ndedetect"
+        # (Sometimes when stationary, unnecessary large signals are detected)
+        # Problem: "nagreresponse yung graph kapag yung mismong adxl yung pinupukpok sa concrete"
+        # (Graph responds when ADXL itself is hit on concrete, not when hammer hits)
+        
+        # Use movement_no_tilt for spike detection (preserves vibration pattern)
+        signal_for_spike_detection = movement_no_tilt
+        signal_history_for_spike.append(signal_for_spike_detection)
+        
+        # Update spike detector
+        is_spike, is_direct_hit, has_oscillation = spike_detector.update(signal_for_spike_detection, sample_count)
+        
+        # Store for status reporting
+        current_is_spike = is_spike
+        current_is_direct_hit = is_direct_hit
+        current_has_oscillation = has_oscillation
+        
+        # STEP 7: Store RAW vibration data (no smoothing)
         # Developer: "for raw data palang, di pa nalalagyan nung FFT"
         # (Just for raw data, FFT not added yet)
         # We need clean raw data first to verify system is working
         # NO smoothing - we need raw signals for later FFT analysis
         
-        # CRITICAL FIX: If raw movement is large but filtered signal is zero,
-        # use the processed signal before threshold (or raw if filters removed everything)
+        # CRITICAL FIX: Filter out direct sensor hits and false positives
         raw_movement_magnitude = abs(movement_from_original)
         
-        if raw_movement_magnitude > 0.01:  # If raw movement > 10mV
-            # Large raw movement detected - this is real vibration!
-            # Use the signal after HPF (before noise threshold) to preserve it
-            if abs(vibration_before_threshold) > 0.0001:
-                # Use HPF output (it preserved the signal)
-                display_signal = vibration_before_threshold
+        # Reject direct sensor hits - these are NOT what we want
+        # We want vibrations from hammer strikes, not direct hits on ADXL
+        if is_direct_hit:
+            # Direct sensor hit detected - reject it (set to zero or very small)
+            # This addresses: "nagreresponse yung graph kapag yung mismong adxl yung pinupukpok"
+            display_signal = 0.0
+            if DEBUG_MODE and sample_count % 100 == 0:
+                print(f"  🚫 DIRECT SENSOR HIT REJECTED (no oscillation pattern)")
+        elif raw_movement_magnitude > 0.01:  # If raw movement > 10mV
+            # Large raw movement detected - check if it's a valid hammer strike
+            if is_spike and has_oscillation:
+                # Valid hammer strike with oscillation - this is what we want!
+                # Use the signal after HPF (before noise threshold) to preserve it
+                if abs(vibration_before_threshold) > 0.0001:
+                    display_signal = vibration_before_threshold
+                else:
+                    display_signal = movement_no_tilt
+            elif is_spike and not has_oscillation:
+                # Spike detected but no oscillation yet - might be developing
+                # Wait a bit, but still show the signal (it might develop oscillation)
+                if abs(vibration_before_threshold) > 0.0001:
+                    display_signal = vibration_before_threshold
+                else:
+                    display_signal = movement_no_tilt
             else:
-                # HPF removed it, but raw movement is large - use movement after tilt removal
-                display_signal = movement_no_tilt
+                # Large movement but not a clear spike - could be valid vibration
+                if abs(vibration_before_threshold) > 0.0001:
+                    display_signal = vibration_before_threshold
+                else:
+                    display_signal = movement_no_tilt
         else:
-            # Small raw movement - use filtered signal (might be noise)
-            display_signal = vibration_signal
+            # Small raw movement - apply stricter filtering to prevent false positives
+            # This addresses: "minsan kpag nakastay lng siya is biglang may mga unnecessary n signals"
+            if quiet_period_samples < QUIET_PERIOD_FOR_VALIDATION:
+                # Not enough quiet period - might be false positive
+                if abs(vibration_signal) > FALSE_POSITIVE_THRESHOLD:
+                    # Large signal without quiet period = likely false positive
+                    display_signal = 0.0
+                else:
+                    display_signal = vibration_signal
+            else:
+                # Had quiet period - more likely to be real
+                display_signal = vibration_signal
         
         data.append(display_signal)  # Store signal for display
 
@@ -358,17 +542,25 @@ try:
             # Check if we're seeing vibration (not just noise)
             recent_data = list(data)[-100:] if len(data) >= 100 else list(data)
             
-            # Determine signal type
+            # Determine signal type with spike detection info
             if floating_data_detected:
                 status = "⚠️ FLOATING DATA DETECTED (not tilt/vibration) - ADC drift/noise"
                 signal_type = "FLOATING"
             elif recent_data:
                 signal_range = max(recent_data) - min(recent_data)
                 if signal_range > IMPACT_THRESHOLD:
-                    status = "✅ IMPACT DETECTED - Look for oscillatory echoes!"
-                    signal_type = "VIBRATION"
-                elif quiet_period_samples > 100:
-                    status = "🔇 QUIET - System idle (no floating data)"
+                    # Check spike detector status
+                    if current_is_direct_hit:
+                        status = "🚫 DIRECT SENSOR HIT (rejected) - Hit concrete, not sensor!"
+                        signal_type = "DIRECT_HIT"
+                    elif current_has_oscillation:
+                        status = "✅ HAMMER STRIKE DETECTED - Oscillatory echoes present!"
+                        signal_type = "VIBRATION"
+                    else:
+                        status = "✅ IMPACT DETECTED - Waiting for oscillation..."
+                        signal_type = "SPIKE"
+                elif quiet_period_samples > QUIET_PERIOD_FOR_VALIDATION:
+                    status = "🔇 QUIET - System idle (ready for impact)"
                     signal_type = "QUIET"
                 else:
                     status = "⏳ Waiting for impact..."
@@ -396,6 +588,8 @@ try:
             print(f"  Final Vibration: {vibration_signal:.6f}V")
             if len(raw_voltage_history) >= 50:
                 print(f"  Voltage Drift: {voltage_drift*1000:.3f}mV/sample | Variation: {voltage_variation*1000:.3f}mV")
+            print(f"  Spike Detection: Spike={current_is_spike}, DirectHit={current_is_direct_hit}, Oscillation={current_has_oscillation}")
+            print(f"  Quiet Period: {quiet_period_samples} samples")
             print(f"  Status: {status}\n")
             
             # DEBUG: Alert if raw movement shows signal but final is zero
