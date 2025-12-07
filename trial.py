@@ -13,11 +13,13 @@ SPI_SPEED_HZ = 5000
 
 DRDY_PIN = 25         # GPIO connected to DRDY (Pin 11)
 MAX_POINTS = 500      # Number of points shown in live plot
-PLOT_UPDATE = 5       # Update plot every 5 samples
-SMOOTH_WINDOW = 5     # Number of samples for moving average
+PLOT_UPDATE = 1       # Update plot every sample for real-time response
+SMOOTH_WINDOW = 3     # Number of samples for moving average (reduced for faster response)
 BASELINE_SAMPLES = 200  # Samples to collect for baseline calibration (increased for better accuracy)
-NOISE_THRESHOLD = 0.001  # Ignore signals below this voltage (1mV) - adjust as needed
-MEDIAN_FILTER_SIZE = 5  # Size of median filter for noise rejection
+NOISE_THRESHOLD = 0.0005  # Ignore signals below this voltage (0.5mV) - lowered for better sensitivity
+MEDIAN_FILTER_SIZE = 3  # Size of median filter (reduced for faster response)
+IMPACT_THRESHOLD = 0.005  # Threshold for impact detection (5mV)
+INVERT_SIGNAL = True  # Set to True if signal is inverted (only negative output)
 
 # ADS1256 commands
 CMD_RESET  = 0xFE
@@ -73,26 +75,33 @@ def configure_adc():
     # Configure DRATE register (data rate)
     # 0xF0 = 30,000 SPS, 0xE0 = 15,000 SPS, 0xD0 = 7,500 SPS
     # 0xC0 = 3,750 SPS, 0xB0 = 2,000 SPS, 0xA0 = 1,000 SPS
-    # Using slower rate (15,000 SPS) for better stability and less noise
-    write_register(REG_DRATE, 0xE0)  # 15,000 SPS - good balance for impact echo
+    # Using faster rate (30,000 SPS) for better impact detection with less delay
+    write_register(REG_DRATE, 0xF0)  # 30,000 SPS - faster response for impact echo
     
     # Configure IO register
     write_register(REG_IO, 0x00)  # All GPIO as inputs
     
     time.sleep(0.1)
 
-def select_channel(channel=0):
+def select_channel(channel=0, invert=False):
     """Select ADC channel
     Channel 0: AIN0-AIN1 (differential)
     Channel 1: AIN2-AIN3 (differential)
     For single-ended with AINCOM: use (channel << 4) | 0x08
+    invert: If True, swap positive/negative to invert signal polarity
     """
     # For differential input: AIN0-AIN1 = 0x01, AIN2-AIN3 = 0x23, etc.
     # MUX format: [Positive Input (4 bits)] | Negative Input (4 bits)]
     if channel == 0:
-        mux_value = 0x01  # AIN0 positive, AIN1 negative
+        if invert:
+            mux_value = 0x10  # AIN1 positive, AIN0 negative (inverted)
+        else:
+            mux_value = 0x01  # AIN0 positive, AIN1 negative
     elif channel == 1:
-        mux_value = 0x23  # AIN2 positive, AIN3 negative
+        if invert:
+            mux_value = 0x32  # AIN3 positive, AIN2 negative (inverted)
+        else:
+            mux_value = 0x23  # AIN2 positive, AIN3 negative
     else:
         # For other channels, use single-ended with AINCOM
         mux_value = (channel << 4) | 0x08  # AINx positive, AINCOM negative
@@ -183,7 +192,7 @@ def calibrate_baseline(num_samples=BASELINE_SAMPLES):
 print("Initializing ADS1256 ADC...")
 adc_reset()
 configure_adc()
-select_channel(0)
+select_channel(0, invert=INVERT_SIGNAL)  # Apply signal inversion if needed
 time.sleep(0.3)  # Allow ADC to stabilize after configuration
 
 # Calibrate baseline to fix floating data issue
@@ -223,16 +232,23 @@ try:
         # Remove baseline offset to fix floating data
         voltage_corrected = voltage - baseline_offset
         
+        # Apply signal inversion if needed (for negative-only output issue)
+        if INVERT_SIGNAL:
+            voltage_corrected = -voltage_corrected
+        
         # Add to median filter buffer
         raw_data_buffer.append(voltage_corrected)
         
-        # Apply median filter to remove noise spikes
+        # Apply median filter to remove noise spikes (light filtering for fast response)
         if len(raw_data_buffer) >= MEDIAN_FILTER_SIZE:
             filtered_voltage = median_filter(raw_data_buffer, MEDIAN_FILTER_SIZE)
         else:
             filtered_voltage = voltage_corrected
         
-        # Noise threshold filtering - only process signals above threshold
+        # Impact detection - check for strong signal immediately
+        impact_detected = abs(filtered_voltage) >= IMPACT_THRESHOLD
+        
+        # Noise threshold filtering - only suppress very small signals
         if abs(filtered_voltage) < NOISE_THRESHOLD:
             # Signal is below threshold, treat as zero (quiet state)
             filtered_voltage = 0.0
@@ -240,17 +256,21 @@ try:
         else:
             quiet_samples = 0
 
-        # Append filtered reading
+        # Append filtered reading immediately (no delay)
         data.append(filtered_voltage)
 
-        # Apply moving average for smoother plot (only if we have enough data)
+        # Light smoothing only (reduced for faster response)
         if len(data) >= SMOOTH_WINDOW:
             smoothed_voltage = moving_average(data, SMOOTH_WINDOW)
             data[-1] = smoothed_voltage  # replace latest with smoothed value
+        
+        # Print impact detection immediately
+        if impact_detected:
+            print(f"*** IMPACT DETECTED! Sample {sample_count}: {filtered_voltage:.6f}V ***")
 
         sample_count += 1
 
-        # Update plot every PLOT_UPDATE samples
+        # Update plot every sample for real-time response
         if sample_count % PLOT_UPDATE == 0:
             line.set_ydata(data)
             # Dynamic y-axis scaling with margin
@@ -262,7 +282,7 @@ try:
                     ax.set_ylim(data_min - margin, data_max + margin)
                 else:
                     # If all quiet, show small range around zero
-                    ax.set_ylim(-NOISE_THRESHOLD * 2, NOISE_THRESHOLD * 2)
+                    ax.set_ylim(-IMPACT_THRESHOLD, IMPACT_THRESHOLD)
             fig.canvas.draw()
             fig.canvas.flush_events()
             
