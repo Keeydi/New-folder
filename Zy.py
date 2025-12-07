@@ -294,8 +294,18 @@ try:
         # Only filter very small signals (electrical noise), not real vibration
         # For impact echo, even small vibrations are important
         vibration_before_threshold = vibration_signal
-        if abs(vibration_signal) < NOISE_THRESHOLD:
-            # Signal is below noise threshold - treat as zero (quiet state)
+        
+        # CRITICAL FIX: Don't filter if we detect significant raw movement
+        # If raw movement is large, it's real vibration, not noise
+        raw_movement_magnitude = abs(movement_from_original)
+        
+        # Only apply noise threshold if raw movement is also small
+        # If raw movement is large (>10mV), it's definitely real vibration
+        if raw_movement_magnitude > 0.01:  # 10mV threshold for raw movement
+            # Large raw movement = real vibration, don't filter!
+            quiet_period_samples = 0
+        elif abs(vibration_signal) < NOISE_THRESHOLD:
+            # Signal is below noise threshold AND raw movement is small - treat as zero
             vibration_signal = 0.0
             quiet_period_samples += 1
         else:
@@ -307,12 +317,21 @@ try:
         # We need clean raw data first to verify system is working
         # NO smoothing - we need raw signals for later FFT analysis
         
-        # DEBUG MODE: Show raw movement if no filtered signal (to diagnose filtering issues)
-        if DEBUG_MODE and abs(vibration_signal) < 0.001:
-            # If filtered signal is zero, show raw movement to see if signal exists
-            # This helps diagnose if signal is being filtered out
-            display_signal = movement_from_original * 0.1  # Scale down for visibility
+        # CRITICAL FIX: If raw movement is large but filtered signal is zero,
+        # use the processed signal before threshold (or raw if filters removed everything)
+        raw_movement_magnitude = abs(movement_from_original)
+        
+        if raw_movement_magnitude > 0.01:  # If raw movement > 10mV
+            # Large raw movement detected - this is real vibration!
+            # Use the signal after HPF (before noise threshold) to preserve it
+            if abs(vibration_before_threshold) > 0.0001:
+                # Use HPF output (it preserved the signal)
+                display_signal = vibration_before_threshold
+            else:
+                # HPF removed it, but raw movement is large - use movement after tilt removal
+                display_signal = movement_no_tilt
         else:
+            # Small raw movement - use filtered signal (might be noise)
             display_signal = vibration_signal
         
         data.append(display_signal)  # Store signal for display
