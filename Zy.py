@@ -20,7 +20,8 @@ NOISE_THRESHOLD = 0.0001  # Ignore signals below this voltage (0.1mV) - very low
 MEDIAN_FILTER_SIZE = 1  # Size of median filter (minimal filtering for maximum sensitivity)
 IMPACT_THRESHOLD = 0.001  # Threshold for impact detection (1mV) - very sensitive
 INVERT_SIGNAL = True  # Set to True if signal is inverted (only negative output)
-PGA_GAIN = 4  # Programmable Gain Amplifier: 1, 2, 4, 8, 16, 32, 64 (higher = more sensitive)
+PGA_GAIN = 32  # Programmable Gain Amplifier: 1, 2, 4, 8, 16, 32, 64 (higher = more sensitive)
+SIGNAL_MULTIPLIER = 3.0  # Software signal multiplier (multiply by this to increase amplitude)
 
 # ADS1256 commands
 CMD_RESET  = 0xFE
@@ -240,6 +241,10 @@ try:
         if INVERT_SIGNAL:
             voltage_corrected = -voltage_corrected
         
+        # Scale up signal if needed (for very small signals)
+        # This multiplies the signal to make impacts more visible
+        voltage_corrected = voltage_corrected * SIGNAL_MULTIPLIER
+        
         # Add to median filter buffer
         raw_data_buffer.append(voltage_corrected)
         
@@ -267,9 +272,9 @@ try:
             smoothed_voltage = moving_average(data, SMOOTH_WINDOW)
             data[-1] = smoothed_voltage  # replace latest with smoothed value
         
-        # Print impact detection immediately
+        # Print impact detection immediately with full details
         if impact_detected:
-            print(f"*** IMPACT DETECTED! Sample {sample_count}: {filtered_voltage:.6f}V ***")
+            print(f"*** IMPACT DETECTED! Sample {sample_count}: {filtered_voltage:.6f}V (Raw: {voltage:.6f}V, Corrected: {voltage_corrected:.6f}V) ***")
 
         sample_count += 1
 
@@ -289,10 +294,11 @@ try:
             fig.canvas.draw()
             fig.canvas.flush_events()
             
-        # Print sample info periodically
+        # Print sample info periodically with max amplitude tracking
         if sample_count % 100 == 0:
             status = "QUIET" if abs(filtered_voltage) < NOISE_THRESHOLD else "ACTIVE"
-            print(f"Sample {sample_count}: Raw={voltage:.6f}V, Filtered={filtered_voltage:.6f}V [{status}]")
+            max_amplitude = max([abs(x) for x in list(data)[-100:]]) if len(data) >= 100 else abs(filtered_voltage)
+            print(f"Sample {sample_count}: Raw={voltage:.6f}V, Filtered={filtered_voltage:.6f}V, Max={max_amplitude:.6f}V [{status}]")
 
 except KeyboardInterrupt:
     print("Live capture stopped by user")
