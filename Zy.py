@@ -14,9 +14,13 @@ SPI_SPEED_HZ = 5000
 DRDY_PIN = 25         # GPIO connected to DRDY (Pin 11)
 MAX_POINTS = 500      # Number of points shown in live plot
 PLOT_UPDATE = 5       # Update plot every 5 samples
-SMOOTH_WINDOW = 5     # Number of samples for moving average
+SMOOTH_WINDOW = 5     # Number of samples for moving average (DISABLED for impact echo)
 BASELINE_SAMPLES = 200  # Samples for baseline calibration (to remove DC/tilt)
-HPF_ALPHA = 0.99      # High-pass filter coefficient (0.99 = ~1Hz cutoff at 15kSPS)
+HPF_ALPHA = 0.90      # High-pass filter coefficient (0.90 = ~20Hz cutoff - very strong filtering)
+                      # Lower = stronger filtering (removes more DC/tilt)
+                      # For impact echo: 0.85-0.95 range works well
+USE_SMOOTHING = False  # DISABLE smoothing for impact echo - need raw vibration signals
+IMPACT_THRESHOLD = 0.01  # Voltage threshold to detect impact events
 
 # ADS1256 commands
 CMD_RESET  = 0xFE
@@ -102,14 +106,16 @@ def calibrate_baseline(num_samples=BASELINE_SAMPLES):
 
 class HighPassFilter:
     """
-    Simple high-pass filter to remove DC drift and low-frequency components.
-    This ensures we only see AC vibration signals, not slow tilt changes.
+    Strong high-pass filter to remove DC drift and low-frequency tilt.
+    For impact echo, we need to see oscillatory waves, not DC/tilt.
+    Lower alpha = stronger filtering (removes more DC).
     """
     def __init__(self, alpha=HPF_ALPHA):
-        self.alpha = alpha  # Filter coefficient
+        self.alpha = alpha  # Filter coefficient (0.90 = strong filtering, removes DC/tilt)
         self.prev_output = 0.0
         self.prev_input = 0.0
         self.initialized = False
+        self.warmup_samples = 50  # Warmup period to stabilize filter
     
     def filter(self, input_value):
         if not self.initialized:
@@ -117,7 +123,17 @@ class HighPassFilter:
             self.prev_input = input_value
             self.prev_output = 0.0
             self.initialized = True
+            self.warmup_count = 0
             return 0.0
+        
+        # Warmup period - filter needs time to stabilize
+        if self.warmup_count < self.warmup_samples:
+            self.warmup_count += 1
+            # High-pass filter: y[n] = alpha * (y[n-1] + x[n] - x[n-1])
+            output = self.alpha * (self.prev_output + input_value - self.prev_input)
+            self.prev_input = input_value
+            self.prev_output = output
+            return 0.0  # Return zero during warmup
         
         # High-pass filter: y[n] = alpha * (y[n-1] + x[n] - x[n-1])
         output = self.alpha * (self.prev_output + input_value - self.prev_input)
@@ -144,15 +160,18 @@ fig, ax = plt.subplots()
 data = deque([0.0]*MAX_POINTS, maxlen=MAX_POINTS)  # Start at 0 (no DC offset)
 line, = ax.plot(data)
 ax.set_ylim(-0.1, 0.1)  # Show around zero for vibration signals
-ax.set_title("ADXL1002Z Live Vibration (AC Component Only)")
+ax.set_title("ADXL1002Z Impact Echo - Vibration Detection (No Smoothing)")
 ax.set_xlabel("Sample")
-ax.set_ylabel("Voltage (V) - Vibration Signal")
+ax.set_ylabel("Voltage (V) - Raw Vibration Signal")
 ax.axhline(y=0, color='r', linestyle='--', alpha=0.3, label='Zero (baseline)')
+ax.grid(True, alpha=0.3)
 ax.legend()
 
-print("\n=== STARTING VIBRATION CAPTURE ===")
-print("DC offset removed - showing only vibration signals (AC component)")
-print("Hit with steel ball hammer to see impact echo response!")
+print("\n=== IMPACT ECHO DETECTION MODE ===")
+print("DC offset removed - Strong high-pass filter active")
+print("Smoothing DISABLED - showing raw vibration signals")
+print("Hit with steel ball hammer - look for oscillatory waves (echoes)!")
+print("Echoes indicate internal delaminations/cracks/voids")
 print("Press Ctrl+C to stop.\n")
 
 # ---------------- MAIN LOOP ----------------
@@ -170,17 +189,16 @@ try:
         # This removes the "floating" static offset
         voltage_ac = voltage - baseline_offset
 
-        # STEP 2: Apply high-pass filter to remove any remaining DC drift
-        # This ensures we only see dynamic vibration, not slow tilt changes
+        # STEP 2: Apply STRONG high-pass filter to remove DC/tilt
+        # This ensures we only see dynamic vibration (oscillatory waves)
         vibration_signal = hpf.filter(voltage_ac)
 
-        # Append vibration signal (AC component only)
-        data.append(vibration_signal)
-
-        # Apply moving average for smoother plot (optional)
-        if len(data) >= SMOOTH_WINDOW:
-            smoothed_voltage = moving_average(data, SMOOTH_WINDOW)
-            data[-1] = smoothed_voltage  # replace latest with smoothed value
+        # STEP 3: For impact echo, we need RAW vibration signals
+        # DO NOT smooth - moving average kills the oscillatory echoes!
+        # The echoes bouncing back from delaminations are high-frequency signals
+        data.append(vibration_signal)  # Store raw vibration signal
+        
+        # NO SMOOTHING for impact echo detection - we need to see the raw waves!
 
         sample_count += 1
 
@@ -191,7 +209,7 @@ try:
             if len(data) > 0:
                 data_max = max(abs(min(data)), abs(max(data)))
                 if data_max > 0.0001:  # Only scale if there's signal
-                    margin = data_max * 0.2 + 0.01
+                    margin = data_max * 0.3 + 0.005  # Slightly larger margin for echoes
                     ax.set_ylim(-margin, margin)
                 else:
                     # If quiet, show small range
@@ -199,11 +217,22 @@ try:
             fig.canvas.draw()
             fig.canvas.flush_events()
 
-        # Print status periodically
+        # Detect impact events and print status
         if sample_count % 500 == 0:
+            # Check if we're seeing vibration (not just noise)
+            recent_data = list(data)[-100:] if len(data) >= 100 else list(data)
+            if recent_data:
+                signal_range = max(recent_data) - min(recent_data)
+                if signal_range > IMPACT_THRESHOLD:
+                    status = "IMPACT DETECTED - Look for oscillatory echoes!"
+                else:
+                    status = "Waiting for impact..."
+            else:
+                status = "Initializing..."
+            
             print(f"Sample {sample_count}: Raw={voltage:.6f}V, "
                   f"DC-removed={voltage_ac:.6f}V, "
-                  f"Vibration={vibration_signal:.6f}V")
+                  f"Vibration={vibration_signal:.6f}V [{status}]")
 
 except KeyboardInterrupt:
     print("Live capture stopped by user")
