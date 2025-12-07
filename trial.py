@@ -300,4 +300,3 @@ finally:
     plt.ioff()
     plt.show()
     print("Resources closed")
-
