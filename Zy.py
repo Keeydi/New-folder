@@ -712,12 +712,12 @@ try:
             elif is_device_movement:
                 status = "🚫 DEVICE MOVEMENT/TILT (rejected) - ZERO output (vibration only!)"
                 signal_type = "DEVICE_MOVEMENT"
-                elif quiet_period_samples > QUIET_PERIOD_FOR_VALIDATION:
-                    status = "🔇 QUIET - System idle (ready for impact)"
-                    signal_type = "QUIET"
-                else:
-                    status = "⏳ Waiting for impact..."
-                    signal_type = "WAITING"
+            elif quiet_period_samples > QUIET_PERIOD_FOR_VALIDATION:
+                status = "🔇 QUIET - System idle (ready for impact)"
+                signal_type = "QUIET"
+            else:
+                status = "⏳ Waiting for impact..."
+                signal_type = "WAITING"
             else:
                 status = "🔄 Initializing..."
                 signal_type = "INIT"
