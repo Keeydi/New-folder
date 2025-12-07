@@ -13,15 +13,10 @@ SPI_SPEED_HZ = 5000
 
 DRDY_PIN = 25         # GPIO connected to DRDY (Pin 11)
 MAX_POINTS = 500      # Number of points shown in live plot
-PLOT_UPDATE = 1       # Update plot every sample for real-time response
-SMOOTH_WINDOW = 1     # Number of samples for moving average (1 = no smoothing, maximum sensitivity)
-BASELINE_SAMPLES = 200  # Samples to collect for baseline calibration (increased for better accuracy)
-NOISE_THRESHOLD = 0.0001  # Ignore signals below this voltage (0.1mV) - very low threshold
-MEDIAN_FILTER_SIZE = 1  # Size of median filter (minimal filtering for maximum sensitivity)
-IMPACT_THRESHOLD = 0.001  # Threshold for impact detection (1mV) - very sensitive
-INVERT_SIGNAL = True  # Set to True if signal is inverted (only negative output)
-PGA_GAIN = 32  # Programmable Gain Amplifier: 1, 2, 4, 8, 16, 32, 64 (higher = more sensitive)
-SIGNAL_MULTIPLIER = 3.0  # Software signal multiplier (multiply by this to increase amplitude)
+PLOT_UPDATE = 5       # Update plot every 5 samples
+SMOOTH_WINDOW = 5     # Number of samples for moving average
+BASELINE_SAMPLES = 200  # Samples for baseline calibration
+NOISE_THRESHOLD = 0.001  # Ignore signals below this voltage (1mV)
 
 # ADS1256 commands
 CMD_RESET  = 0xFE
@@ -31,12 +26,12 @@ CMD_RDATA  = 0x01
 CMD_WREG   = 0x50  # write register
 CMD_RREG   = 0x10  # read register
 
-# ADS1256 Register Addresses
+# ADS1256 registers
 REG_STATUS = 0x00
-REG_MUX = 0x01
-REG_ADCON = 0x02
-REG_DRATE = 0x03
-REG_IO = 0x04
+REG_MUX    = 0x01
+REG_ADCON  = 0x02
+REG_DRATE  = 0x03
+REG_IO     = 0x04
 
 # ---------------- SETUP SPI ----------------
 spi = spidev.SpiDev()
@@ -48,7 +43,19 @@ h = lgpio.gpiochip_open(0)
 lgpio.gpio_claim_input(h, DRDY_PIN)
 
 # ---------------- FUNCTIONS ----------------
+def write_register(reg, value):
+    """Write to ADS1256 register"""
+    spi.xfer2([CMD_WREG | reg, 0x00, value])
+    time.sleep(0.0001)
+
+def read_register(reg):
+    """Read from ADS1256 register"""
+    spi.xfer2([CMD_RREG | reg, 0x00])
+    time.sleep(0.0001)
+    return spi.readbytes(1)[0]
+
 def adc_reset():
+    """Reset ADS1256"""
     spi.xfer2([CMD_RESET])
     time.sleep(0.1)
     spi.xfer2([CMD_WAKEUP])
@@ -56,61 +63,37 @@ def adc_reset():
     spi.xfer2([CMD_SYNC])
     time.sleep(0.1)
 
-def write_register(reg, value):
-    """Write to ADS1256 register"""
-    spi.xfer2([CMD_WREG | reg, 0x00, value])
-    time.sleep(0.01)
-
-def read_register(reg):
-    """Read from ADS1256 register"""
-    # CMD_RREG format: [CMD_RREG | reg, number_of_bytes - 1]
-    spi.xfer2([CMD_RREG | reg, 0x00])  # Read 1 byte (0x00 = 1-1)
-    time.sleep(0.0001)
-    return spi.readbytes(1)[0]
-
 def configure_adc():
-    """Configure ADS1256 for stable operation"""
+    """Properly configure ADS1256 to prevent floating data"""
+    print("Configuring ADS1256 registers...")
+    
+    # Configure STATUS register
+    # Bit 7: Reset (0), Bit 6-4: Reserved, Bit 3: ACAL (0=off), Bit 2: BUFEN (1=enable buffer)
+    # Bit 1: Reserved, Bit 0: ORDER (0=MSB first)
+    write_register(REG_STATUS, 0x04)  # Enable buffer, MSB first
+    
+    # Configure MUX register for differential input AIN0-AIN1
+    # This prevents floating inputs - use differential mode for accelerometer
+    # AINP=AIN0 (bits 7-4), AINN=AIN1 (bits 3-0)
+    write_register(REG_MUX, 0x01)  # AIN0-AIN1 differential
+    time.sleep(0.01)
+    
     # Configure ADCON register
-    # Bit 7: CLKOUT off, Bit 6-4: Sensor detect off, Bit 3-0: PGA gain
-    # PGA gain values: 0=1x, 1=2x, 2=4x, 3=8x, 4=16x, 5=32x, 6=64x
-    pga_value = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4, 32: 5, 64: 6}.get(PGA_GAIN, 2)
-    write_register(REG_ADCON, pga_value)  # Set PGA gain for better sensitivity
-    print(f"PGA Gain set to {PGA_GAIN}x for better sensitivity")
+    # Bit 7-5: Reserved, Bit 4-2: CLK (000=oscillator), Bit 1-0: Sensor Detect (00=off)
+    write_register(REG_ADCON, 0x20)  # Default settings
     
     # Configure DRATE register (data rate)
-    # 0xF0 = 30,000 SPS, 0xE0 = 15,000 SPS, 0xD0 = 7,500 SPS
-    # 0xC0 = 3,750 SPS, 0xB0 = 2,000 SPS, 0xA0 = 1,000 SPS
-    # Using faster rate (30,000 SPS) for better impact detection with less delay
-    write_register(REG_DRATE, 0xF0)  # 30,000 SPS - faster response for impact echo
+    # 0xE0 = 15,000 SPS - good balance for impact echo
+    write_register(REG_DRATE, 0xE0)  # 15,000 SPS
     
-    # Configure IO register
+    # Configure IO register - set unused pins to avoid floating
     write_register(REG_IO, 0x00)  # All GPIO as inputs
     
-    time.sleep(0.1)
+    print("ADC configuration complete")
 
-def select_channel(channel=0, invert=False):
-    """Select ADC channel
-    Channel 0: AIN0-AIN1 (differential)
-    Channel 1: AIN2-AIN3 (differential)
-    For single-ended with AINCOM: use (channel << 4) | 0x08
-    invert: If True, swap positive/negative to invert signal polarity
-    """
-    # For differential input: AIN0-AIN1 = 0x01, AIN2-AIN3 = 0x23, etc.
-    # MUX format: [Positive Input (4 bits)] | Negative Input (4 bits)]
-    if channel == 0:
-        if invert:
-            mux_value = 0x10  # AIN1 positive, AIN0 negative (inverted)
-        else:
-            mux_value = 0x01  # AIN0 positive, AIN1 negative
-    elif channel == 1:
-        if invert:
-            mux_value = 0x32  # AIN3 positive, AIN2 negative (inverted)
-        else:
-            mux_value = 0x23  # AIN2 positive, AIN3 negative
-    else:
-        # For other channels, use single-ended with AINCOM
-        mux_value = (channel << 4) | 0x08  # AINx positive, AINCOM negative
-    
+def select_channel(ainp=0, ainn=1):
+    """Select differential channel (AINP positive, AINN negative)"""
+    mux_value = (ainp << 4) | ainn
     write_register(REG_MUX, mux_value)
     time.sleep(0.01)  # Allow MUX to settle
 
@@ -124,42 +107,18 @@ def wait_for_drdy(timeout=0.1):
     return True  # DRDY is low
 
 def read_adc():
-    """Read 24-bit value from ADS1256 (assumes DRDY already checked)"""
-    # Send read command
+    """Read 24-bit value from ADS1256"""
     spi.xfer2([CMD_RDATA])
-    time.sleep(0.0005)  # Small delay for data ready
+    time.sleep(0.0005)
     raw = spi.readbytes(3)
-    if len(raw) != 3:
-        raise ValueError(f"Expected 3 bytes, got {len(raw)}")
     value = (raw[0]<<16) | (raw[1]<<8) | raw[2]
-    # Sign extend 24-bit to 32-bit
     if value & 0x800000:
         value -= 0x1000000
     return value
 
 def adc_to_voltage(raw):
-    """Convert 24-bit ADC reading to voltage"""
-    # ADS1256 is 24-bit, full scale is ±0x7FFFFF
+    """Convert 24-bit ADC value to voltage"""
     return (raw / 0x7FFFFF) * VREF
-
-def moving_average(data_deque, window_size):
-    """Calculate moving average"""
-    if len(data_deque) < window_size:
-        return sum(data_deque)/len(data_deque)
-    else:
-        return sum(list(data_deque)[-window_size:])/window_size
-
-def median_filter(data_list, window_size):
-    """Apply median filter to reduce noise spikes"""
-    if len(data_list) < window_size:
-        return data_list[-1] if data_list else 0.0
-    else:
-        window = list(data_list)[-window_size:]
-        return np.median(window)
-
-def is_valid_signal(voltage, baseline, threshold):
-    """Check if signal is above noise threshold"""
-    return abs(voltage - baseline) >= threshold
 
 def calibrate_baseline(num_samples=BASELINE_SAMPLES):
     """Calibrate baseline to remove DC offset and floating data"""
@@ -168,7 +127,7 @@ def calibrate_baseline(num_samples=BASELINE_SAMPLES):
     time.sleep(1)  # Give user time to read
     
     baseline_readings = []
-    
+
     for i in range(num_samples):
         if wait_for_drdy():
             raw_val = read_adc()
@@ -176,54 +135,55 @@ def calibrate_baseline(num_samples=BASELINE_SAMPLES):
             baseline_readings.append(voltage)
         else:
             print(f"  Warning: DRDY timeout at sample {i+1}")
-        
+
         if (i + 1) % 50 == 0:
             print(f"  Collected {i + 1}/{num_samples} samples...")
-    
+
     baseline = np.mean(baseline_readings)
     std_dev = np.std(baseline_readings)
     noise_level = std_dev * 2  # 2-sigma noise level
-    
+
     print(f"Baseline calibration complete:")
     print(f"  Mean: {baseline:.6f} V")
     print(f"  Std Dev: {std_dev:.6f} V")
     print(f"  Estimated noise level: ±{noise_level:.6f} V")
-    print(f"  Offset will be subtracted from all readings")
-    print(f"  Signals below {NOISE_THRESHOLD:.6f} V will be ignored\n")
-    
-    return baseline, noise_level
+    print(f"  Offset will be subtracted from all readings\n")
+
+    return baseline
+
+def moving_average(data_deque, window_size):
+    if len(data_deque) < window_size:
+        return sum(data_deque)/len(data_deque)
+    else:
+        return sum(list(data_deque)[-window_size:])/window_size
 
 # ---------------- INITIALIZE ----------------
 print("Initializing ADS1256 ADC...")
 adc_reset()
 configure_adc()
-select_channel(0, invert=INVERT_SIGNAL)  # Apply signal inversion if needed
+select_channel(0, 1)  # Use differential input AIN0-AIN1
 time.sleep(0.3)  # Allow ADC to stabilize after configuration
 
 # Calibrate baseline to fix floating data issue
-baseline_offset, noise_level = calibrate_baseline()
+baseline_offset = calibrate_baseline()
 print(f"Baseline offset: {baseline_offset:.6f} V")
-print("Starting data acquisition with noise filtering...\n")
+print("Starting data acquisition with baseline correction...\n")
 
 # ---------------- SETUP LIVE PLOT ----------------
 plt.ion()
 fig, ax = plt.subplots()
-data = deque([0.0]*MAX_POINTS, maxlen=MAX_POINTS)  # Initialize with zeros for baseline-corrected data
+data = deque([0.0]*MAX_POINTS, maxlen=MAX_POINTS)  # Start at 0 after baseline correction
 line, = ax.plot(data)
-ax.set_ylim(-VREF/2, VREF/2)  # Adjusted for baseline-corrected data
+ax.set_ylim(-0.1, 0.1)  # Adjusted for baseline-corrected data
 ax.set_title("ADXL1002Z Live Vibration (Baseline Corrected)")
 ax.set_xlabel("Sample")
-ax.set_ylabel("Voltage (V) - Baseline Corrected")
-ax.axhline(y=0, color='r', linestyle='--', alpha=0.3, label='Zero Reference')
-ax.legend()
+ax.set_ylabel("Voltage (V)")
+ax.grid(True)
 
 print("Starting live vibration capture. Press Ctrl+C to stop.")
 
 # ---------------- MAIN LOOP ----------------
 sample_count = 0
-raw_data_buffer = deque(maxlen=MEDIAN_FILTER_SIZE)  # Buffer for median filter
-quiet_samples = 0  # Count of samples below threshold
-
 try:
     while True:
         # Wait for DRDY before reading
@@ -233,55 +193,27 @@ try:
             
         raw_val = read_adc()
         voltage = adc_to_voltage(raw_val)
-        
+
         # Remove baseline offset to fix floating data
         voltage_corrected = voltage - baseline_offset
         
-        # Apply signal inversion if needed (for negative-only output issue)
-        if INVERT_SIGNAL:
-            voltage_corrected = -voltage_corrected
-        
-        # Scale up signal if needed (for very small signals)
-        # This multiplies the signal to make impacts more visible
-        voltage_corrected = voltage_corrected * SIGNAL_MULTIPLIER
-        
-        # Add to median filter buffer
-        raw_data_buffer.append(voltage_corrected)
-        
-        # Apply median filter only if size > 1 (for maximum sensitivity, skip if size is 1)
-        if MEDIAN_FILTER_SIZE > 1 and len(raw_data_buffer) >= MEDIAN_FILTER_SIZE:
-            filtered_voltage = median_filter(raw_data_buffer, MEDIAN_FILTER_SIZE)
-        else:
-            filtered_voltage = voltage_corrected  # Use raw signal for maximum sensitivity
-        
-        # Impact detection - check for strong signal immediately
-        impact_detected = abs(filtered_voltage) >= IMPACT_THRESHOLD
-        
-        # Noise threshold filtering - only suppress very small signals
-        # Don't zero out signals, just use them as-is for maximum sensitivity
-        if abs(filtered_voltage) < NOISE_THRESHOLD:
-            quiet_samples += 1
-        else:
-            quiet_samples = 0
+        # Only process signals above noise threshold
+        if abs(voltage_corrected) < NOISE_THRESHOLD:
+            voltage_corrected = 0.0
 
-        # Append filtered reading immediately (no delay) - keep all signals
-        data.append(filtered_voltage)
+        # Append corrected reading
+        data.append(voltage_corrected)
 
-        # Minimal smoothing for faster response (only if window size > 1)
-        if SMOOTH_WINDOW > 1 and len(data) >= SMOOTH_WINDOW:
+        # Apply moving average for smoother plot (only if we have enough data)
+        if len(data) >= SMOOTH_WINDOW:
             smoothed_voltage = moving_average(data, SMOOTH_WINDOW)
             data[-1] = smoothed_voltage  # replace latest with smoothed value
-        
-        # Print impact detection immediately with full details
-        if impact_detected:
-            print(f"*** IMPACT DETECTED! Sample {sample_count}: {filtered_voltage:.6f}V (Raw: {voltage:.6f}V, Corrected: {voltage_corrected:.6f}V) ***")
 
         sample_count += 1
 
-        # Update plot every sample for real-time response
+        # Update plot every PLOT_UPDATE samples
         if sample_count % PLOT_UPDATE == 0:
             line.set_ydata(data)
-            # Dynamic y-axis scaling with margin
             if len(data) > 0:
                 data_min, data_max = min(data), max(data)
                 # Only scale if there's actual signal variation
@@ -290,15 +222,14 @@ try:
                     ax.set_ylim(data_min - margin, data_max + margin)
                 else:
                     # If all quiet, show small range around zero
-                    ax.set_ylim(-IMPACT_THRESHOLD, IMPACT_THRESHOLD)
+                    ax.set_ylim(-NOISE_THRESHOLD * 2, NOISE_THRESHOLD * 2)
             fig.canvas.draw()
             fig.canvas.flush_events()
-            
-        # Print sample info periodically with max amplitude tracking
+        
+        # Print sample info periodically
         if sample_count % 100 == 0:
-            status = "QUIET" if abs(filtered_voltage) < NOISE_THRESHOLD else "ACTIVE"
-            max_amplitude = max([abs(x) for x in list(data)[-100:]]) if len(data) >= 100 else abs(filtered_voltage)
-            print(f"Sample {sample_count}: Raw={voltage:.6f}V, Filtered={filtered_voltage:.6f}V, Max={max_amplitude:.6f}V [{status}]")
+            status = "QUIET" if abs(voltage_corrected) < NOISE_THRESHOLD else "ACTIVE"
+            print(f"Sample {sample_count}: Raw={voltage:.6f}V, Corrected={voltage_corrected:.6f}V [{status}]")
 
 except KeyboardInterrupt:
     print("Live capture stopped by user")
