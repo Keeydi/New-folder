@@ -21,6 +21,8 @@ HPF_ALPHA = 0.90      # High-pass filter coefficient (0.90 = ~20Hz cutoff - very
                       # For impact echo: 0.85-0.95 range works well
 USE_SMOOTHING = False  # DISABLE smoothing for impact echo - need raw vibration signals
 IMPACT_THRESHOLD = 0.01  # Voltage threshold to detect impact events
+NOISE_THRESHOLD = 0.005  # Ignore signals below this (5mV) - filters electrical noise
+                         # Adjust based on your amplifier gain and noise level
 
 # ADS1256 commands
 CMD_RESET  = 0xFE
@@ -101,14 +103,17 @@ def calibrate_baseline(num_samples=BASELINE_SAMPLES):
     
     baseline = np.mean(baseline_readings)
     std_dev = np.std(baseline_readings)
+    noise_level = std_dev * 3  # 3-sigma noise level
     
     print(f"\nOriginal position calibration complete:")
     print(f"  Original Position (includes tilt/gravity): {baseline:.6f} V")
     print(f"  Noise level: ±{std_dev:.6f} V")
+    print(f"  Estimated noise threshold: ±{noise_level:.6f} V")
+    print(f"  Signals below {NOISE_THRESHOLD:.6f} V will be filtered as noise")
     print(f"  All readings will show: (current_position - original_position)")
     print(f"  This gives us the 'distance of movement' from original position\n")
     
-    return baseline
+    return baseline, noise_level
 
 class HighPassFilter:
     """
@@ -155,7 +160,12 @@ time.sleep(0.1)
 
 # Calibrate baseline to remove DC offset (tilt/gravity component)
 # This fixes the "floating data" problem by removing static offset
-baseline_offset = calibrate_baseline()
+baseline_offset, measured_noise = calibrate_baseline()
+
+# Adjust noise threshold based on measured noise if it's higher than default
+if measured_noise > NOISE_THRESHOLD:
+    NOISE_THRESHOLD = measured_noise * 1.5  # Use 1.5x measured noise as threshold
+    print(f"Auto-adjusted noise threshold to {NOISE_THRESHOLD:.6f} V based on calibration")
 
 # Initialize high-pass filter to remove any remaining DC drift
 hpf = HighPassFilter(alpha=HPF_ALPHA)
@@ -176,11 +186,17 @@ ax.legend()
 print("\n=== RAW DATA COLLECTION MODE ===")
 print("Measuring: Distance of movement vs original position")
 print("High-pass filter active - removing slow tilt changes")
+print("Noise threshold filtering active - ignoring electrical noise")
 print("Showing RAW vibration data (no smoothing, no FFT yet)")
 print("")
 print("Purpose: Verify system is working correctly")
 print("Hit with steel ball hammer - observe raw vibration response")
 print("FFT analysis for defect detection will be added later")
+print("")
+print("NOTE: If you see continuous noise when idle:")
+print("  - Check XY-FD amplifier gain potentiometers (may be too high)")
+print("  - Adjust NOISE_THRESHOLD in code if needed")
+print("  - Ensure stable power supply")
 print("Press Ctrl+C to stop.\n")
 
 # ---------------- MAIN LOOP ----------------
@@ -205,7 +221,14 @@ try:
         # The filter removes any remaining DC/low-frequency components
         vibration_signal = hpf.filter(movement_from_original)
 
-        # STEP 3: Store RAW vibration data (no smoothing)
+        # STEP 3: Apply noise threshold to filter electrical noise
+        # The amplifier and ADC can pick up noise even when stationary
+        # Only show signals above the noise threshold
+        if abs(vibration_signal) < NOISE_THRESHOLD:
+            # Signal is below noise threshold - treat as zero (quiet state)
+            vibration_signal = 0.0
+
+        # STEP 4: Store RAW vibration data (no smoothing)
         # Developer: "for raw data palang, di pa nalalagyan nung FFT"
         # (Just for raw data, FFT not added yet)
         # We need clean raw data first to verify system is working
